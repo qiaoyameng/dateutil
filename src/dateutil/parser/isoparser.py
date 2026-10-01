@@ -134,6 +134,12 @@ class isoparser(object):
         components, pos = self._parse_isodate(dt_str)
 
         if len(dt_str) > pos:
+            if dt_str[pos:pos + 1] == b'/':
+                # '/' is the ISO-8601 interval delimiter, not a valid
+                # date/time separator. Intervals can be parsed with
+                # dateutil.parser.isointervalparse.
+                raise ValueError('String contains unknown ISO components')
+
             if self._sep is None or dt_str[pos:pos + 1] == self._sep:
                 components += self._parse_isotime(dt_str[pos + 1:])
             else:

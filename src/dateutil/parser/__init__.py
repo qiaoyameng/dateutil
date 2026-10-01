@@ -6,9 +6,11 @@ from ._parser import UnknownTimezoneWarning
 from ._parser import __doc__
 
 from .isoparser import isoparser, isoparse
+from .isointerval import isointervalparser, isointervalparse, ISOInterval
 
 __all__ = ['parse', 'parser', 'parserinfo',
            'isoparse', 'isoparser',
+           'isointervalparse', 'isointervalparser', 'ISOInterval',
            'ParserError',
            'UnknownTimezoneWarning']
 
