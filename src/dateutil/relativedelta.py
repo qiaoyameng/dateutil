@@ -12,7 +12,62 @@ from ._common import weekday
 
 MO, TU, WE, TH, FR, SA, SU = weekdays = tuple(weekday(x) for x in range(7))
 
-__all__ = ["relativedelta", "MO", "TU", "WE", "TH", "FR", "SA", "SU"]
+__all__ = ["relativedelta", "MO", "TU", "WE", "TH", "FR", "SA", "SU",
+           "DayResolution", "MonthResolutionError"]
+
+
+class DayResolution(object):
+    """
+    Strategies used to resolve a target date whose day component does not
+    exist in the target month (e.g. January 31 plus one month, or an
+    absolute ``day=31`` applied to February).
+
+    ``LAST_DAY``
+        Clamp the day to the last valid day of the target month. This is
+        the default and reproduces the historical ``relativedelta``
+        behavior (January 31 + 1 month -> February 28/29).
+
+    ``RAISE``
+        Raise a :class:`MonthResolutionError` instead of producing a
+        date. The original input date is attached to the exception as
+        ``original`` (along with ``year``, ``month``, ``day`` and
+        ``max_day``), so callers can recover without losing their input.
+
+    ``OVERFLOW``
+        Keep the extra days and let them spill over into the following
+        months by ordinary date arithmetic (January 31 + 1 month ->
+        March 2/3). Spilling always moves forward on the calendar, even
+        when a negative number of months was added
+        (October 31 - 1 month -> October 1).
+    """
+    LAST_DAY = "last_day"
+    RAISE = "raise"
+    OVERFLOW = "overflow"
+
+    @staticmethod
+    def _values():
+        return (DayResolution.LAST_DAY,
+                DayResolution.RAISE,
+                DayResolution.OVERFLOW)
+
+
+class MonthResolutionError(ValueError):
+    """
+    Exception raised when a relativedelta with
+    ``day_resolution=DayResolution.RAISE`` would land on a day that does
+    not exist in the target month (for example, February 31).
+
+    The exception does not modify or consume the input; the original
+    date or datetime is available as :attr:`original`.
+    """
+    def __init__(self, message, original=None, year=None, month=None,
+                 day=None, max_day=None):
+        super(MonthResolutionError, self).__init__(message)
+        self.original = original
+        self.year = year
+        self.month = month
+        self.day = day
+        self.max_day = max_day
 
 
 class relativedelta(object):
@@ -67,6 +122,25 @@ class relativedelta(object):
             Set the yearday or the non-leap year day (jump leap days).
             These are converted to day/month/leapdays information.
 
+        day_resolution:
+            Selects the *calendar arithmetic strategy* used when the
+            resulting day does not exist in the target month (the classic
+            example being January 31 plus one month). One of the
+            :class:`DayResolution` constants:
+
+            * ``DayResolution.LAST_DAY`` (the default): clamp to the last
+              valid day of the target month. This preserves the historical
+              behavior exactly, so existing code is unaffected.
+            * ``DayResolution.RAISE``: raise
+              :class:`MonthResolutionError`; the original input is kept on
+              the exception as ``original``.
+            * ``DayResolution.OVERFLOW``: let the excess days spill past
+              the end of the target month (January 31 + 1 month ->
+              March 2/3).
+
+            The strategy applies both to relative ``months``/``years``
+            shifts and to an absolute ``day`` that is out of range.
+
     There are relative and absolute forms of the keyword
     arguments. The plural is relative, and the singular is
     absolute. For each argument in the order below, the absolute form
@@ -84,7 +158,42 @@ class relativedelta(object):
     6. Seconds
     7. Microseconds
 
-    Finally, weekday is applied, using the rule described above.
+    Concretely, when a relativedelta is added to a date the calendar
+    fields are resolved in this well-defined order:
+
+    1. The absolute ``year`` and relative ``years`` determine the year.
+    2. The absolute ``month`` and relative ``months`` determine the
+       month (and may carry the year over by one).
+    3. The day is selected: the absolute ``day`` replaces the original
+       day first, otherwise the original day is kept. If that day does
+       not exist in the target month, ``day_resolution`` decides what
+       happens.
+    4. Relative ``days``, ``weeks`` and ``leapdays`` (plus the relative
+       hours/minutes/seconds/microseconds and absolute time fields) are
+       added to that date as ordinary timedelta arithmetic.
+    5. Finally, ``weekday`` is applied, using the rule described above.
+
+    Because step 3 is applied *before* step 4, the two relativedeltas
+    ``relativedelta(day=30) + relativedelta(months=1)`` and
+    ``relativedelta(months=1, day=30)`` describe genuinely different
+    operations; relativedeltas are applied one at a time and are never
+    pre-merged. In particular, applying a one-month delta twice is *not*
+    assumed to be identical to applying a two-month delta once, and with
+    ``DayResolution.OVERFLOW`` the difference is preserved:
+
+    >>> from datetime import date
+    >>> from dateutil.relativedelta import relativedelta, DayResolution
+    >>> overflow = dict(day_resolution=DayResolution.OVERFLOW)
+    >>> d = date(2020, 1, 31)
+    >>> d + relativedelta(months=1, **overflow) \\
+    ...   + relativedelta(months=1, **overflow)
+    datetime.date(2020, 4, 2)
+    >>> d + relativedelta(months=2, **overflow)
+    datetime.date(2020, 3, 31)
+    >>> d + relativedelta(months=1) + relativedelta(months=1)
+    datetime.date(2020, 3, 29)
+    >>> d + relativedelta(months=2)
+    datetime.date(2020, 3, 31)
 
     For example
 
@@ -107,7 +216,14 @@ class relativedelta(object):
                  hours=0, minutes=0, seconds=0, microseconds=0,
                  year=None, month=None, day=None, weekday=None,
                  yearday=None, nlyearday=None,
-                 hour=None, minute=None, second=None, microsecond=None):
+                 hour=None, minute=None, second=None, microsecond=None,
+                 day_resolution=DayResolution.LAST_DAY):
+
+        if day_resolution not in DayResolution._values():
+            raise ValueError(
+                "day_resolution must be one of DayResolution.LAST_DAY, "
+                "DayResolution.RAISE or DayResolution.OVERFLOW, "
+                "not {!r}".format(day_resolution))
 
         if dt1 and dt2:
             # datetime is a subclass of date. So both must be date
@@ -141,6 +257,7 @@ class relativedelta(object):
             self.second = None
             self.microsecond = None
             self._has_time = 0
+            self.day_resolution = DayResolution.LAST_DAY
 
             # Get year / month delta between the two
             months = (dt1.year - dt2.year) * 12 + (dt1.month - dt2.month)
@@ -167,6 +284,10 @@ class relativedelta(object):
             delta = dt1 - dtm
             self.seconds = delta.seconds + delta.days * 86400
             self.microseconds = delta.microseconds
+            # The requested strategy never changes the computed difference
+            # (the reverse operation always clamps); it is retained on the
+            # object so the relativedelta round-trips its configuration.
+            self.day_resolution = day_resolution
         else:
             # Check for non-integer values in integer-only quantities
             if any(x is not None and x != int(x) for x in (years, months)):
@@ -191,6 +312,7 @@ class relativedelta(object):
             self.minute = minute
             self.second = second
             self.microsecond = microsecond
+            self.day_resolution = day_resolution
 
             if any(x is not None and int(x) != x
                    for x in (year, month, day, hour,
@@ -312,10 +434,16 @@ class relativedelta(object):
                               month=self.month, day=self.day,
                               weekday=self.weekday, hour=self.hour,
                               minute=self.minute, second=self.second,
-                              microsecond=self.microsecond)
+                              microsecond=self.microsecond,
+                              day_resolution=self.day_resolution)
 
     def __add__(self, other):
         if isinstance(other, relativedelta):
+            # As with the absolute components, the right-hand operand's
+            # explicit strategy takes precedence over the left-hand one.
+            day_resolution = (other.day_resolution
+                              if other.day_resolution != DayResolution.LAST_DAY
+                              else self.day_resolution)
             return self.__class__(years=other.years + self.years,
                                  months=other.months + self.months,
                                  days=other.days + self.days,
@@ -341,7 +469,8 @@ class relativedelta(object):
                                          else self.second),
                                  microsecond=(other.microsecond if other.microsecond
                                               is not None else
-                                              self.microsecond))
+                                              self.microsecond),
+                                 day_resolution=day_resolution)
         if isinstance(other, datetime.timedelta):
             return self.__class__(years=self.years,
                                   months=self.months,
@@ -358,7 +487,8 @@ class relativedelta(object):
                                   hour=self.hour,
                                   minute=self.minute,
                                   second=self.second,
-                                  microsecond=self.microsecond)
+                                  microsecond=self.microsecond,
+                                  day_resolution=self.day_resolution)
         if not isinstance(other, datetime.date):
             return NotImplemented
         elif self._has_time and not isinstance(other, datetime.datetime):
@@ -374,8 +504,49 @@ class relativedelta(object):
             elif month < 1:
                 year -= 1
                 month += 12
-        day = min(calendar.monthrange(year, month)[1],
-                  self.day or other.day)
+        target_day = self.day or other.day
+        max_day = calendar.monthrange(year, month)[1]
+
+        # Resolve a day that does not exist in the target month according
+        # to the configured calendar arithmetic strategy. The input date
+        # is never modified; on RAISE it is handed back on the exception.
+        if target_day > max_day:
+            if self.day_resolution == DayResolution.RAISE:
+                raise MonthResolutionError(
+                    "day %d is out of range for %04d-%02d "
+                    "(last valid day is %d)" %
+                    (target_day, year, month, max_day),
+                    original=other, year=year, month=month,
+                    day=target_day, max_day=max_day)
+            elif self.day_resolution == DayResolution.OVERFLOW:
+                # Anchor on day 1 of the target month and walk forward;
+                # the excess days spill into later months.
+                repl = {"year": year, "month": month, "day": 1}
+                for attr in ["hour", "minute", "second", "microsecond"]:
+                    value = getattr(self, attr)
+                    if value is not None:
+                        repl[attr] = value
+                days = target_day - 1 + self.days
+                if self.leapdays and month > 2 and calendar.isleap(year):
+                    days += self.leapdays
+                ret = (other.replace(**repl)
+                       + datetime.timedelta(days=days,
+                                            hours=self.hours,
+                                            minutes=self.minutes,
+                                            seconds=self.seconds,
+                                            microseconds=self.microseconds))
+                if self.weekday:
+                    weekday, nth = self.weekday.weekday, self.weekday.n or 1
+                    jumpdays = (abs(nth) - 1) * 7
+                    if nth > 0:
+                        jumpdays += (7 - ret.weekday() + weekday) % 7
+                    else:
+                        jumpdays += (ret.weekday() - weekday) % 7
+                        jumpdays *= -1
+                    ret += datetime.timedelta(days=jumpdays)
+                return ret
+
+        day = min(max_day, target_day)
         repl = {"year": year, "month": month, "day": day}
         for attr in ["hour", "minute", "second", "microsecond"]:
             value = getattr(self, attr)
@@ -410,6 +581,9 @@ class relativedelta(object):
     def __sub__(self, other):
         if not isinstance(other, relativedelta):
             return NotImplemented   # In case the other object defines __rsub__
+        day_resolution = (other.day_resolution
+                          if other.day_resolution != DayResolution.LAST_DAY
+                          else self.day_resolution)
         return self.__class__(years=self.years - other.years,
                              months=self.months - other.months,
                              days=self.days - other.days,
@@ -431,10 +605,11 @@ class relativedelta(object):
                              minute=(self.minute if self.minute is not None else
                                      other.minute),
                              second=(self.second if self.second is not None else
-                                     other.second),
+                                      other.second),
                              microsecond=(self.microsecond if self.microsecond
                                           is not None else
-                                          other.microsecond))
+                                          other.microsecond),
+                             day_resolution=day_resolution)
 
     def __abs__(self):
         return self.__class__(years=abs(self.years),
@@ -452,7 +627,8 @@ class relativedelta(object):
                               hour=self.hour,
                               minute=self.minute,
                               second=self.second,
-                              microsecond=self.microsecond)
+                              microsecond=self.microsecond,
+                              day_resolution=self.day_resolution)
 
     def __neg__(self):
         return self.__class__(years=-self.years,
@@ -470,7 +646,8 @@ class relativedelta(object):
                              hour=self.hour,
                              minute=self.minute,
                              second=self.second,
-                             microsecond=self.microsecond)
+                             microsecond=self.microsecond,
+                             day_resolution=self.day_resolution)
 
     def __bool__(self):
         return not (not self.years and
@@ -513,7 +690,8 @@ class relativedelta(object):
                              hour=self.hour,
                              minute=self.minute,
                              second=self.second,
-                             microsecond=self.microsecond)
+                             microsecond=self.microsecond,
+                             day_resolution=self.day_resolution)
 
     __rmul__ = __mul__
 
@@ -542,7 +720,8 @@ class relativedelta(object):
                 self.hour == other.hour and
                 self.minute == other.minute and
                 self.second == other.second and
-                self.microsecond == other.microsecond)
+                self.microsecond == other.microsecond and
+                self.day_resolution == other.day_resolution)
 
     def __hash__(self):
         return hash((
@@ -562,6 +741,7 @@ class relativedelta(object):
             self.minute,
             self.second,
             self.microsecond,
+            self.day_resolution,
         ))
 
     def __ne__(self, other):
@@ -589,6 +769,9 @@ class relativedelta(object):
             value = getattr(self, attr)
             if value is not None:
                 l.append("{attr}={value}".format(attr=attr, value=repr(value)))
+        if self.day_resolution != DayResolution.LAST_DAY:
+            l.append("day_resolution={value!r}".format(
+                value=self.day_resolution))
         return "{classname}({attrs})".format(classname=self.__class__.__name__,
                                              attrs=", ".join(l))
 

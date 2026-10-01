@@ -100,6 +100,43 @@ If the result falls on a day after the last one of the month, the last day of th
     >>> date(2003,5,31)+relativedelta(months=-1)
     datetime.date(2003, 4, 30)
 
+That clamping behavior is the default, but financial systems use several
+conventions for dates such as January 31 plus one month. The
+``day_resolution`` argument selects one of three explicit strategies:
+``DayResolution.LAST_DAY`` (the default, shown above),
+``DayResolution.RAISE`` and ``DayResolution.OVERFLOW``.
+
+``DayResolution.RAISE`` raises ``MonthResolutionError`` instead of
+clamping; the original, still-usable input is attached as ``original``.
+
+.. doctest::
+
+    >>> date(2003,1,31)+relativedelta(months=+1,
+    ...     day_resolution=DayResolution.RAISE)
+    Traceback (most recent call last):
+        ...
+    MonthResolutionError: day 31 is out of range for 2003-02 (last valid day is 28)
+
+``DayResolution.OVERFLOW`` keeps the surplus days and lets them spill
+past the end of the target month by ordinary date arithmetic.
+
+.. doctest::
+
+    >>> date(2003,1,31)+relativedelta(months=+1,
+    ...     day_resolution=DayResolution.OVERFLOW)
+    datetime.date(2003, 3, 3)
+
+Because each relativedelta is applied separately and two deltas are
+never merged beforehand, adding one month twice is not the same as
+adding two months once - note the intermediate clamping (or overflow):
+
+.. doctest::
+
+    >>> date(2000,1,31)+relativedelta(months=+1)+relativedelta(months=+1)
+    datetime.date(2000, 3, 29)
+    >>> date(2000,1,31)+relativedelta(months=+2)
+    datetime.date(2000, 3, 31)
+
 .. doctest:: relativedelta
 
     >>> date(2000,2,28)+relativedelta(years=+1)

@@ -8,7 +8,8 @@ import unittest
 
 import pytest
 
-from dateutil.relativedelta import relativedelta, MO, TU, WE, FR, SU
+from dateutil.relativedelta import (relativedelta, MO, TU, WE, FR, SU,
+                                    DayResolution, MonthResolutionError)
 
 
 class RelativeDeltaTest(unittest.TestCase):
@@ -762,6 +763,193 @@ class RelativeDeltaWeeksPropertySetterTest(unittest.TestCase):
         rd.weeks = -1  # does not change anything
         self.assertEqual(rd.days, -8)
         self.assertEqual(rd.weeks, -1)
+
+
+class DayResolutionTest(unittest.TestCase):
+    """Tests for the explicit calendar-arithmetic strategies applied when
+    the target day does not exist in the target month."""
+    jan31_leap = date(2020, 1, 31)
+    jan31_common = date(2019, 1, 31)
+
+    def test_default_is_last_day(self):
+        rd = relativedelta(months=1)
+        self.assertEqual(rd.day_resolution, DayResolution.LAST_DAY)
+        self.assertEqual(self.jan31_leap + rd, date(2020, 2, 29))
+        self.assertEqual(self.jan31_common + relativedelta(months=1),
+                         date(2019, 2, 28))
+
+    def test_explicit_last_day_matches_default(self):
+        rd = relativedelta(months=1,
+                           day_resolution=DayResolution.LAST_DAY)
+        self.assertEqual(self.jan31_leap + rd,
+                         self.jan31_leap + relativedelta(months=1))
+
+    def test_overflow_common_and_leap_year(self):
+        rd = relativedelta(months=1,
+                           day_resolution=DayResolution.OVERFLOW)
+        self.assertEqual(self.jan31_leap + rd, date(2020, 3, 2))
+        self.assertEqual(self.jan31_common + rd, date(2019, 3, 3))
+
+    def test_raise_on_missing_day(self):
+        with self.assertRaises(MonthResolutionError) as cm:
+            self.jan31_leap + relativedelta(
+                months=1, day_resolution=DayResolution.RAISE)
+        exc = cm.exception
+        self.assertIsInstance(exc, ValueError)
+        self.assertIs(exc.original, self.jan31_leap)
+        self.assertEqual((exc.year, exc.month, exc.day, exc.max_day),
+                         (2020, 2, 31, 29))
+
+    def test_raise_does_not_trigger_when_day_exists(self):
+        result = date(2020, 1, 15) + relativedelta(
+            months=1, day_resolution=DayResolution.RAISE)
+        self.assertEqual(result, date(2020, 2, 15))
+
+    def test_leap_day_plus_one_year(self):
+        feb29 = date(2020, 2, 29)
+        self.assertEqual(feb29 + relativedelta(years=1), date(2021, 2, 28))
+        self.assertEqual(
+            feb29 + relativedelta(
+                years=1, day_resolution=DayResolution.OVERFLOW),
+            date(2021, 3, 1))
+        with self.assertRaises(MonthResolutionError):
+            feb29 + relativedelta(years=1,
+                                  day_resolution=DayResolution.RAISE)
+
+    def test_negative_months(self):
+        self.assertEqual(date(2020, 3, 31) + relativedelta(months=-1),
+                         date(2020, 2, 29))
+        self.assertEqual(
+            date(2020, 3, 31) + relativedelta(
+                months=-1, day_resolution=DayResolution.OVERFLOW),
+            date(2020, 3, 2))
+        with self.assertRaises(MonthResolutionError) as cm:
+            date(2020, 10, 31) + relativedelta(
+                months=-1, day_resolution=DayResolution.RAISE)
+        self.assertEqual(
+            (cm.exception.year, cm.exception.month, cm.exception.max_day),
+            (2020, 9, 30))
+        # Spilling always walks forward on the calendar.
+        self.assertEqual(
+            date(2020, 10, 31) + relativedelta(
+                months=-1, day_resolution=DayResolution.OVERFLOW),
+            date(2020, 10, 1))
+
+    def test_two_single_steps_differ_from_one_double_step(self):
+        # The deltas must be applied one at a time, never pre-merged.
+        overflow = relativedelta(
+            months=1, day_resolution=DayResolution.OVERFLOW)
+        self.assertEqual(self.jan31_leap + overflow + overflow,
+                         date(2020, 4, 2))
+        self.assertEqual(
+            self.jan31_leap + relativedelta(
+                months=2, day_resolution=DayResolution.OVERFLOW),
+            date(2020, 3, 31))
+        # Historical clamping behavior shows the same kind of difference.
+        self.assertEqual(
+            self.jan31_leap + relativedelta(months=1)
+            + relativedelta(months=1),
+            date(2020, 3, 29))
+        self.assertEqual(self.jan31_leap + relativedelta(months=2),
+                         date(2020, 3, 31))
+
+    def test_absolute_day_resolution(self):
+        self.assertEqual(date(2020, 2, 10) + relativedelta(day=31),
+                         date(2020, 2, 29))
+        self.assertEqual(
+            date(2020, 2, 10) + relativedelta(
+                day=31, day_resolution=DayResolution.OVERFLOW),
+            date(2020, 3, 2))
+        with self.assertRaises(MonthResolutionError) as cm:
+            date(2020, 2, 10) + relativedelta(
+                day=31, day_resolution=DayResolution.RAISE)
+        self.assertEqual(cm.exception.original, date(2020, 2, 10))
+
+    def test_weekday_is_applied_after_day_resolution(self):
+        overflow = dict(day_resolution=DayResolution.OVERFLOW)
+        # Jan 31 + 1 month overflows to Monday 2020-03-02.
+        self.assertEqual(
+            self.jan31_leap + relativedelta(months=1, weekday=MO(1),
+                                            **overflow),
+            date(2020, 3, 2))
+        self.assertEqual(
+            self.jan31_leap + relativedelta(months=1, weekday=SU(1),
+                                            **overflow),
+            date(2020, 3, 8))
+        # Clamped Feb 29 2020 is a Saturday; first Monday is March 2.
+        self.assertEqual(
+            self.jan31_leap + relativedelta(months=1, weekday=MO(1)),
+            date(2020, 3, 2))
+
+    def test_relative_days_added_after_resolution(self):
+        self.assertEqual(
+            self.jan31_leap + relativedelta(months=1, days=2),
+            date(2020, 3, 2))
+        self.assertEqual(
+            self.jan31_leap + relativedelta(
+                months=1, days=2, day_resolution=DayResolution.OVERFLOW),
+            date(2020, 3, 4))
+
+    def test_overflow_with_absolute_time_components(self):
+        result = datetime(2020, 1, 31, 9, 30) + relativedelta(
+            months=1, hour=12, day_resolution=DayResolution.OVERFLOW)
+        # Only the hour is replaced; the original minute is kept.
+        self.assertEqual(result, datetime(2020, 3, 2, 12, 30))
+
+    def test_overflow_combined_with_timedelta_keeps_strategy(self):
+        rd = relativedelta(months=1,
+                           day_resolution=DayResolution.OVERFLOW)
+        combined = rd + timedelta(days=5)
+        self.assertEqual(combined.day_resolution,
+                         DayResolution.OVERFLOW)
+        self.assertEqual(self.jan31_leap + combined, date(2020, 3, 7))
+
+    def test_invalid_day_resolution(self):
+        with self.assertRaises(ValueError):
+            relativedelta(months=1, day_resolution="nonsense")
+
+    def test_strategy_propagates_through_operations(self):
+        overflow = relativedelta(
+            months=1, day_resolution=DayResolution.OVERFLOW)
+        self.assertEqual((-overflow).day_resolution,
+                         DayResolution.OVERFLOW)
+        self.assertEqual((overflow + relativedelta(days=3)).day_resolution,
+                         DayResolution.OVERFLOW)
+        self.assertEqual(
+            (relativedelta(months=1)
+             + relativedelta(days=1, day_resolution=DayResolution.RAISE))
+            .day_resolution,
+            DayResolution.RAISE)
+
+    def test_equality_hash_and_repr(self):
+        overflow = relativedelta(
+            months=1, day_resolution=DayResolution.OVERFLOW)
+        self.assertNotEqual(overflow, relativedelta(months=1))
+        self.assertEqual(
+            hash(overflow),
+            hash(relativedelta(months=1,
+                               day_resolution=DayResolution.OVERFLOW)))
+        self.assertIn("day_resolution='overflow'", repr(overflow))
+        self.assertEqual(repr(relativedelta(months=1)),
+                         "relativedelta(months=+1)")
+
+    @pytest.mark.gettz
+    def test_timezone_aware_datetime_preserved(self):
+        from dateutil.tz import gettz
+        nyc = gettz("America/New_York")
+        dt = datetime(2020, 1, 31, 12, 0, tzinfo=nyc)
+        overflow = dt + relativedelta(
+            months=1, day_resolution=DayResolution.OVERFLOW)
+        self.assertEqual(overflow,
+                         datetime(2020, 3, 2, 12, 0, tzinfo=nyc))
+        self.assertIs(overflow.tzinfo, dt.tzinfo)
+        clamped = dt + relativedelta(months=1)
+        self.assertEqual(clamped,
+                         datetime(2020, 2, 29, 12, 0, tzinfo=nyc))
+        with self.assertRaises(MonthResolutionError) as cm:
+            dt + relativedelta(months=1,
+                               day_resolution=DayResolution.RAISE)
+        self.assertEqual(cm.exception.original, dt)
 
 
 # vim:ts=4:sw=4:et

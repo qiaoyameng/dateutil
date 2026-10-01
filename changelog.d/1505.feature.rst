@@ -1,0 +1,10 @@
+Added an explicit ``day_resolution`` argument to ``relativedelta`` selecting
+how a date whose day does not exist in the target month is resolved
+(e.g. January 31 plus one month): ``DayResolution.LAST_DAY`` (the default,
+preserving the historical clamping behavior), ``DayResolution.RAISE`` (raises
+``MonthResolutionError`` while keeping the original input on the exception)
+and ``DayResolution.OVERFLOW`` (lets the excess days spill into following
+months). The application order (year/month, day resolution, relative time
+components, weekday) is documented, and repeated application is never merged
+into a single delta, so adding one month twice remains distinct from adding
+two months once.
