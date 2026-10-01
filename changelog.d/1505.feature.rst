@@ -1,0 +1,8 @@
+Added ``dateutil.parser.parse_candidates`` (and the corresponding
+``parser.parse_candidates`` method), a candidate mode which returns every
+distinct interpretation of an ambiguous date string (e.g. ``"03/04/05"``)
+as a list of ``DateCandidate`` objects, each recording the resolved
+datetime, the year/month/day assignment and which components were
+explicitly specified in the input. Invalid dates are discarded, equivalent
+results are de-duplicated, and explicit month names or four-digit years
+are not treated as ambiguous. The ``parse`` interface is unchanged.

@@ -38,6 +38,7 @@ import warnings
 
 from calendar import monthrange
 from io import StringIO
+from itertools import permutations
 
 import six
 from six import integer_types, text_type
@@ -49,7 +50,8 @@ from warnings import warn
 from .. import relativedelta
 from .. import tz
 
-__all__ = ["parse", "parserinfo", "ParserError"]
+__all__ = ["parse", "parse_candidates", "parserinfo", "ParserError",
+           "DateCandidate"]
 
 
 # TODO: pandas.core.tools.datetimes imports this explicitly.  Might be worth
@@ -565,6 +567,69 @@ class _ymd(list):
         return year, month, day
 
 
+class DateCandidate(object):
+    """
+    A single possible interpretation of an ambiguous date/time string, as
+    returned by :meth:`parser.parse_candidates`.
+
+    .. attribute:: datetime
+
+        The :class:`datetime.datetime` this interpretation resolves to,
+        with any components missing from the input string filled in from
+        the default.
+
+    .. attribute:: year
+    .. attribute:: month
+    .. attribute:: day
+
+        The year/month/day values this interpretation assigns to the
+        corresponding component. A value of ``None`` means the component
+        was not present in the input string and was taken from the
+        default instead.
+
+    .. attribute:: specified
+
+        A frozenset containing a subset of ``{'year', 'month', 'day'}``
+        indicating which date components were explicitly specified in the
+        input string (as opposed to filled in from the default).
+    """
+
+    __slots__ = ('datetime', 'year', 'month', 'day', 'specified')
+
+    def __init__(self, datetime, year, month, day, specified):
+        self.datetime = datetime
+        self.year = year
+        self.month = month
+        self.day = day
+        self.specified = specified
+
+    def __repr__(self):
+        return ('{cls}(datetime={dt!r}, year={y!r}, month={m!r}, '
+                'day={d!r}, specified={s!r})').format(
+                    cls=self.__class__.__name__, dt=self.datetime,
+                    y=self.year, m=self.month, d=self.day,
+                    s=sorted(self.specified))
+
+    def __eq__(self, other):
+        if not isinstance(other, DateCandidate):
+            return NotImplemented
+        return (self.datetime == other.datetime and
+                self.year == other.year and
+                self.month == other.month and
+                self.day == other.day and
+                self.specified == other.specified)
+
+    def __ne__(self, other):
+        result = self.__eq__(other)
+        if result is NotImplemented:
+            return result
+        return not result
+
+    def __hash__(self):
+        return hash((self.datetime, self.year, self.month, self.day,
+                     self.specified))
+
+
 class parser(object):
     def __init__(self, info=None):
         self.info = info or parserinfo()
@@ -658,6 +723,200 @@ class parser(object):
         else:
             return ret
 
+    def parse_candidates(self, timestr, default=None, ignoretz=False,
+                         tzinfos=None, **kwargs):
+        """
+        Parse the date/time string into every distinct plausible
+        :class:`datetime.datetime`, for use when the input is ambiguous
+        (e.g. ``"03/04/05"``) and the possible interpretations should be
+        presented to the user rather than resolved implicitly.
+
+        The same tokens are extracted as by :meth:`parse`, but instead of
+        resolving the year/month/day ordering with ``dayfirst`` and
+        ``yearfirst``, every assignment of the date components which is
+        consistent with the current :class:`parserinfo`, the ``default``
+        and the input tokens is returned. Interpretations producing
+        invalid dates (e.g. February 30th) are discarded and equivalent
+        interpretations are de-duplicated. Components which are explicit
+        in the input, such as month names or four-digit years, are not
+        treated as ambiguous.
+
+        :param timestr:
+            Any date/time string using the supported formats.
+
+        :param default:
+            The default datetime object, if this is a datetime object and
+            not ``None``, elements specified in ``timestr`` replace
+            elements in the default object.
+
+        :param ignoretz:
+            If set ``True``, time zones in parsed strings are ignored and
+            naive :class:`datetime.datetime` objects are returned.
+
+        :param tzinfos:
+            Additional time zone names / aliases which may be present in
+            the string. See :meth:`parse` for details.
+
+        :param \\*\\*kwargs:
+            Keyword arguments as passed to ``_parse()``. ``dayfirst`` and
+            ``yearfirst`` do not filter the candidates, but the
+            interpretation :meth:`parse` would have chosen is sorted
+            first.
+
+        :return:
+            Returns a list of :class:`DateCandidate` objects, sorted so
+            that the interpretation :meth:`parse` would have returned
+            comes first. Each candidate exposes the resolved
+            :class:`~datetime.datetime` along with the year/month/day
+            assignment and which of those components were explicitly
+            specified in the input.
+
+        :raises ParserError:
+            Raised for invalid or unknown string formats, or if no valid
+            interpretation of the input exists.
+        """
+        if default is None:
+            default = datetime.datetime.now().replace(hour=0, minute=0,
+                                                      second=0, microsecond=0)
+
+        res, skipped_tokens, ymd = self._parse_with_ymd(timestr, **kwargs)
+
+        if res is None:
+            raise ParserError("Unknown string format: %s", timestr)
+
+        if len(res) == 0:
+            raise ParserError("String does not contain a date: %s", timestr)
+
+        dayfirst = kwargs.get('dayfirst')
+        if dayfirst is None:
+            dayfirst = self.info.dayfirst
+
+        yearfirst = kwargs.get('yearfirst')
+        if yearfirst is None:
+            yearfirst = self.info.yearfirst
+
+        # The interpretation parse() would have chosen is sorted first.
+        preferred = ymd.resolve_ymd(yearfirst, dayfirst)
+        if preferred[0] is not None:
+            preferred = (self.info.convertyear(
+                preferred[0], ymd.century_specified),) + preferred[1:]
+
+        candidates = []
+        for year, month, day, specified in self._resolve_ymd_candidates(ymd):
+            candidate_res = self._copy_result(res)
+            candidate_res.year = year
+            candidate_res.month = month
+            candidate_res.day = day
+
+            try:
+                ret = self._build_naive(candidate_res, default)
+            except ValueError:
+                # Interpretations producing invalid dates (e.g. February
+                # 30th) are not candidates.
+                continue
+
+            if not ignoretz:
+                ret = self._build_tzaware(ret, candidate_res, tzinfos)
+
+            candidates.append(DateCandidate(datetime=ret, year=year,
+                                            month=month, day=day,
+                                            specified=specified))
+
+        if not candidates:
+            raise ParserError("String does not contain a valid date: %s",
+                              timestr)
+
+        candidates.sort(
+            key=lambda c: (c.year, c.month, c.day) != preferred)
+        return candidates
+
+    def _resolve_ymd_candidates(self, ymd):
+        """
+        Enumerate the distinct ways the tokens collected in ``ymd`` can be
+        assigned to year, month and day.
+
+        Tokens with an explicit label (month names, four-digit years) are
+        fixed to their labeled component; the remaining tokens are
+        permuted over the remaining components following the same
+        structural rules as :meth:`_ymd.resolve_ymd`.
+
+        :return:
+            Yields ``(year, month, day, specified)`` tuples, where any of
+            the first three elements may be ``None`` (indicating the
+            component comes from the default) and ``specified`` is a
+            frozenset of the component names found in the input.
+        """
+        info = self.info
+        len_ymd = len(ymd)
+
+        labeled = {}
+        for role, idx in (('year', ymd.ystridx),
+                          ('month', ymd.mstridx),
+                          ('day', ymd.dstridx)):
+            if idx is not None:
+                labeled[idx] = role
+
+        fixed = {}
+        free_idxs = []
+        for idx, value in enumerate(ymd):
+            role = labeled.get(idx)
+            if role is None:
+                free_idxs.append(idx)
+            else:
+                fixed[role] = value
+
+        free_roles = [role for role in ('year', 'month', 'day')
+                      if role not in fixed]
+
+        def valid(role, value):
+            if role == 'year':
+                # As in resolve_ymd, a bare number is only treated as a
+                # year when it cannot be a month or day, unless there are
+                # three date tokens.
+                return value >= 0 and (len_ymd == 3 or value > 31)
+            elif role == 'month':
+                return 1 <= value <= 12
+            else:
+                return 1 <= value <= 31
+
+        seen = set()
+        for roles in permutations(free_roles, len(free_idxs)):
+            assignment = dict(fixed)
+            for idx, role in zip(free_idxs, roles):
+                if not valid(role, ymd[idx]):
+                    break
+                assignment[role] = ymd[idx]
+            else:
+                if len_ymd == 1 and not fixed and 'month' in assignment:
+                    # A single bare number is a day or a year, never a
+                    # month (mirrors resolve_ymd).
+                    continue
+                if (len_ymd == 2 and 'month' not in fixed and
+                        'month' not in assignment):
+                    # Two-token dates always include a month (mirrors
+                    # resolve_ymd).
+                    continue
+
+                year = assignment.get('year')
+                if year is not None:
+                    year = info.convertyear(year, ymd.century_specified)
+                month = assignment.get('month')
+                day = assignment.get('day')
+
+                key = (year, month, day)
+                if key in seen:
+                    continue
+                seen.add(key)
+
+                yield year, month, day, frozenset(assignment)
+
+    def _copy_result(self, res):
+        new_res = self._result()
+        for attr in self._result.__slots__:
+            setattr(new_res, attr, getattr(res, attr))
+        new_res.century_specified = getattr(res, 'century_specified', False)
+        return new_res
+
     class _result(_resultbase):
         __slots__ = ["year", "month", "day", "weekday",
                      "hour", "minute", "second", "microsecond",
@@ -703,6 +962,23 @@ class parser(object):
                 >>> parse("Today is January 1, 2047 at 8:21:00AM", fuzzy_with_tokens=True)
                 (datetime.datetime(2047, 1, 1, 8, 21), (u'Today is ', u' ', u'at '))
 
+        """
+        res, skipped_tokens, _ = self._parse_with_ymd(
+            timestr, dayfirst=dayfirst, yearfirst=yearfirst, fuzzy=fuzzy,
+            fuzzy_with_tokens=fuzzy_with_tokens)
+        return res, skipped_tokens
+
+    def _parse_with_ymd(self, timestr, dayfirst=None, yearfirst=None,
+                        fuzzy=False, fuzzy_with_tokens=False):
+        """
+        Private method implementing :meth:`_parse`, additionally returning
+        the intermediate :class:`_ymd` token list so that callers such as
+        :meth:`parse_candidates` can enumerate alternative interpretations
+        of the year/month/day components.
+
+        :return:
+            Returns a tuple ``(res, skipped_tokens, ymd)``. On failure both
+            ``res`` and ``ymd`` are ``None``.
         """
         if fuzzy_with_tokens:
             fuzzy = True
@@ -861,16 +1137,16 @@ class parser(object):
             res.day = day
 
         except (IndexError, ValueError):
-            return None, None
+            return None, None, None
 
         if not info.validate(res):
-            return None, None
+            return None, None, None
 
         if fuzzy_with_tokens:
             skipped_tokens = self._recombine_skipped(l, skipped_idxs)
-            return res, tuple(skipped_tokens)
+            return res, tuple(skipped_tokens), ymd
         else:
-            return res, None
+            return res, None, ymd
 
     def _parse_numeric_token(self, tokens, idx, info, ymd, res, fuzzy):
         # Token is a number
@@ -1366,6 +1642,44 @@ def parse(timestr, parserinfo=None, **kwargs):
         return parser(parserinfo).parse(timestr, **kwargs)
     else:
         return DEFAULTPARSER.parse(timestr, **kwargs)
+
+
+def parse_candidates(timestr, parserinfo=None, **kwargs):
+    """
+
+    Parse a string into every distinct plausible interpretation, using
+    the ``parserinfo`` parameters.
+
+    This is the candidate-mode counterpart of :func:`parse`: rather than
+    resolving an ambiguous date (e.g. ``"03/04/05"``) with ``dayfirst``
+    and ``yearfirst``, it returns all interpretations consistent with the
+    ``parserinfo``, the ``default`` and the input tokens, so that they
+    can be presented to the user for disambiguation.
+
+    :param timestr:
+        A string containing a date/time stamp.
+
+    :param parserinfo:
+        A :class:`parserinfo` object containing parameters for the
+        parser. If ``None``, the default arguments to the
+        :class:`parserinfo` constructor are used.
+
+    The ``**kwargs`` parameter takes the same keyword arguments as
+    :func:`parse`.
+
+    :return:
+        Returns a list of :class:`DateCandidate` objects, sorted so that
+        the interpretation :func:`parse` would have returned comes first.
+        See :meth:`parser.parse_candidates` for details.
+
+    :raises ParserError:
+        Raised for invalid or unknown string formats, or if no valid
+        interpretation of the input exists.
+    """
+    if parserinfo:
+        return parser(parserinfo).parse_candidates(timestr, **kwargs)
+    else:
+        return DEFAULTPARSER.parse_candidates(timestr, **kwargs)
 
 
 class _tzparser(object):

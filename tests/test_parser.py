@@ -8,7 +8,7 @@ import sys
 
 from dateutil import tz
 from dateutil.tz import tzoffset
-from dateutil.parser import parse, parserinfo
+from dateutil.parser import parse, parse_candidates, parser, parserinfo
 from dateutil.parser import ParserError
 from dateutil.parser import UnknownTimezoneWarning
 
@@ -962,3 +962,167 @@ def test_parsererror_repr():
     s = repr(ParserError("Problem with string: %s", "2019-01-01"))
 
     assert s == "ParserError('Problem with string: %s', '2019-01-01')"
+
+
+class TestParseCandidates(object):
+    DEFAULT = datetime(2020, 6, 15)
+
+    def test_ambiguous_date_enumerates_all_interpretations(self):
+        candidates = parse_candidates("03/04/05", default=self.DEFAULT)
+
+        assert {c.datetime for c in candidates} == {
+            datetime(2003, 4, 5), datetime(2003, 5, 4),
+            datetime(2004, 3, 5), datetime(2004, 5, 3),
+            datetime(2005, 3, 4), datetime(2005, 4, 3),
+        }
+
+        for c in candidates:
+            assert c.specified == frozenset(['year', 'month', 'day'])
+            assert (c.datetime.year, c.datetime.month, c.datetime.day) == \
+                (c.year, c.month, c.day)
+
+    def test_parse_result_is_first_candidate(self):
+        candidates = parse_candidates("03/04/05", default=self.DEFAULT)
+
+        assert candidates[0].datetime == parse("03/04/05",
+                                               default=self.DEFAULT)
+
+    @pytest.mark.parametrize('info,expected', [
+        (parserinfo(dayfirst=True), datetime(2005, 4, 3)),
+        (parserinfo(yearfirst=True), datetime(2003, 4, 5)),
+        (parserinfo(dayfirst=True, yearfirst=True), datetime(2003, 5, 4)),
+    ])
+    def test_parserinfo_preferred_interpretation_first(self, info, expected):
+        candidates = parser(info).parse_candidates("03/04/05",
+                                                   default=self.DEFAULT)
+
+        assert candidates[0].datetime == expected
+        assert len(candidates) == 6
+
+    def test_invalid_dates_filtered(self):
+        # 30 February does not exist, so the MDY interpretation is dropped
+        candidates = parse_candidates("02/30/05", default=self.DEFAULT)
+
+        assert {c.datetime for c in candidates} == {
+            datetime(2002, 5, 30),
+            datetime(2030, 2, 5),
+            datetime(2030, 5, 2),
+        }
+
+    def test_equivalent_results_deduplicated(self):
+        candidates = parse_candidates("01/01/01", default=self.DEFAULT)
+
+        assert len(candidates) == 1
+        assert candidates[0].datetime == datetime(2001, 1, 1)
+
+    def test_month_name_not_treated_as_ambiguous(self):
+        candidates = parse_candidates("04 Mar 2005", default=self.DEFAULT)
+
+        assert len(candidates) == 1
+        assert candidates[0].datetime == datetime(2005, 3, 4)
+
+    def test_month_name_still_allows_numeric_ambiguity(self):
+        candidates = parse_candidates("Mar 04 05", default=self.DEFAULT)
+
+        assert {c.datetime for c in candidates} == {
+            datetime(2004, 3, 5), datetime(2005, 3, 4),
+        }
+        for c in candidates:
+            assert c.month == 3
+
+    def test_four_digit_year_not_treated_as_ambiguous(self):
+        candidates = parse_candidates("2005/03/04", default=self.DEFAULT)
+
+        assert {c.datetime for c in candidates} == {
+            datetime(2005, 3, 4), datetime(2005, 4, 3),
+        }
+        for c in candidates:
+            assert c.year == 2005
+
+    def test_fuzzy_ignored_tokens(self):
+        candidates = parse_candidates("Meet me on 03/04/05 at the cafe",
+                                      default=self.DEFAULT, fuzzy=True)
+        expected = parse_candidates("03/04/05", default=self.DEFAULT)
+
+        assert {c.datetime for c in candidates} == \
+            {c.datetime for c in expected}
+
+    def test_two_digit_year_window(self):
+        # Two-digit years are interpreted within [-50, +49] years of the
+        # current year, matching parserinfo.convertyear.
+        current_year = datetime.now().year
+        near = (current_year + 49) % 100
+        far = (current_year + 50) % 100
+
+        near_candidates = parse_candidates(
+            "15/01/{0:02d}".format(near), default=self.DEFAULT)
+        far_candidates = parse_candidates(
+            "15/01/{0:02d}".format(far), default=self.DEFAULT)
+
+        near_years = {c.year for c in near_candidates
+                      if c.month == 1 and c.day == 15}
+        far_years = {c.year for c in far_candidates
+                     if c.month == 1 and c.day == 15}
+
+        assert near_years == {current_year + 49}
+        assert far_years == {current_year - 50}
+
+    def test_timezone_text_applies_to_all_candidates(self):
+        candidates = parse_candidates("03/04/05 10:30 UTC",
+                                      default=self.DEFAULT)
+
+        assert len(candidates) == 6
+        for c in candidates:
+            assert c.datetime.tzinfo is tz.UTC
+            assert (c.datetime.hour, c.datetime.minute) == (10, 30)
+
+    def test_timezone_text_with_tzinfos(self):
+        candidates = parse_candidates("03/04/05 10:30 BRST",
+                                      default=self.DEFAULT,
+                                      tzinfos={"BRST": -7200})
+
+        for c in candidates:
+            assert c.datetime.tzinfo == tzoffset("BRST", -7200)
+
+    def test_default_components_not_reported_as_specified(self):
+        candidates = parse_candidates("03/04", default=self.DEFAULT)
+
+        assert {c.datetime for c in candidates} == {
+            datetime(2020, 3, 4), datetime(2020, 4, 3),
+        }
+        for c in candidates:
+            assert 'year' not in c.specified
+            assert c.year is None
+            assert c.datetime.year == 2020
+
+    def test_time_only_string_reports_no_date_components(self):
+        candidates = parse_candidates("14:30", default=self.DEFAULT)
+
+        assert len(candidates) == 1
+        candidate = candidates[0]
+        assert candidate.specified == frozenset()
+        assert (candidate.year, candidate.month, candidate.day) == \
+            (None, None, None)
+        assert candidate.datetime == datetime(2020, 6, 15, 14, 30)
+
+    def test_module_level_parse_candidates_with_parserinfo(self):
+        candidates = parse_candidates("03/04/05",
+                                      parserinfo=parserinfo(dayfirst=True),
+                                      default=self.DEFAULT)
+
+        assert candidates[0].datetime == datetime(2005, 4, 3)
+
+    def test_unknown_string_raises(self):
+        with pytest.raises(ParserError):
+            parse_candidates("not a date at all", default=self.DEFAULT)
+
+    def test_no_valid_interpretation_raises(self):
+        with pytest.raises(ParserError):
+            parse_candidates("2005/13/40", default=self.DEFAULT)
+
+    def test_parse_interface_unchanged(self):
+        # The original parse interface still returns a single datetime
+        result = parse("03/04/05", default=self.DEFAULT)
+
+        assert isinstance(result, datetime)
+        assert result == datetime(2005, 3, 4)
