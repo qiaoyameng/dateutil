@@ -5,6 +5,7 @@ import base64
 import copy
 import gc
 import os
+import struct
 import sys
 import unittest
 import weakref
@@ -2120,6 +2121,200 @@ def test_samoa_transition():
     dt_after = (dt.astimezone(tz.UTC) + timedelta(minutes=1)).astimezone(APIA)
     assert dt_after == datetime(2011, 12, 31, tzinfo=APIA)
     assert dt_after.utcoffset() == timedelta(hours=14)
+
+
+def _tzif_v2(transitions, ttinfo, abbreviations, posix_tz,
+             transition_types=None):
+    nul = b'\x00'
+    newline = b'\n'
+    if transition_types is None:
+        transition_types = range(1, len(transitions) + 1)
+
+    def block(v2=False):
+        abbreviation_data = nul.join(abbreviations) + nul
+        data = struct.pack('>6l', 0, 0, 0,
+                           len(transitions), len(ttinfo),
+                           len(abbreviation_data))
+        time_format = '>q' if v2 else '>l'
+        data += b''.join(struct.pack(time_format, transition)
+                         for transition in transitions)
+        data += bytes(transition_types)
+        for utc_offset, isdst, abbreviation_index in ttinfo:
+            data += struct.pack('>lbb', utc_offset, isdst,
+                                abbreviation_index)
+        data += abbreviation_data
+        if v2:
+            data += newline + posix_tz + newline
+        return data
+
+    return (b'TZif' + nul + nul * 15 + block() +
+            b'TZif2' + nul * 15 + block(v2=True))
+
+
+def test_offset_changes_tzrange_half_hour():
+    timezone = tz.tzrange(
+        'OLD', -19800, 'NEW', -18000,
+        relativedelta(hours=0, month=1, day=1),
+        relativedelta(hours=0, month=7, day=1))
+
+    start = datetime(2020, 1, 1, tzinfo=tz.UTC)
+    end = datetime(2021, 1, 1, tzinfo=tz.UTC)
+
+    changes = list(tz.iter_offset_changes(timezone, start, end))
+
+    assert changes == [
+        tz.OffsetChange(
+            datetime(2020, 1, 1, 5, 30, tzinfo=tz.UTC),
+            timedelta(hours=-5, minutes=-30),
+            timedelta(hours=-5), 'OLD', 'NEW'),
+        tz.OffsetChange(
+            datetime(2020, 7, 1, 5, 30, tzinfo=tz.UTC),
+            timedelta(hours=-5),
+            timedelta(hours=-5, minutes=-30), 'NEW', 'OLD'),
+    ]
+
+    transition = changes[0].transition
+    before = timezone.fromutc((transition - timedelta(seconds=1))
+                              .replace(tzinfo=timezone))
+    after = timezone.fromutc((transition + timedelta(seconds=1))
+                             .replace(tzinfo=timezone))
+
+    assert before == datetime(2019, 12, 31, 23, 59, 59,
+                              tzinfo=timezone)
+    assert before.utcoffset() == timedelta(hours=-5, minutes=-30)
+    assert before.tzname() == 'OLD'
+    assert after == datetime(2020, 1, 1, 0, 30, 1,
+                             tzinfo=timezone)
+    assert after.utcoffset() == timedelta(hours=-5)
+    assert after.tzname() == 'NEW'
+
+
+def test_offset_changes_name_only():
+    timezone = tz.tzrange(
+        'A', 0, 'B', 0,
+        relativedelta(hours=0, month=1, day=1),
+        relativedelta(hours=0, month=7, day=1))
+
+    changes = list(tz.iter_offset_changes(
+        timezone,
+        datetime(2020, 1, 1, tzinfo=tz.UTC),
+        datetime(2020, 7, 2, tzinfo=tz.UTC)))
+
+    assert [(change.old_name, change.new_name) for change in changes] == \
+        [('A', 'B'), ('B', 'A')]
+    assert all(change.old_offset == change.new_offset == timedelta(0)
+               for change in changes)
+
+
+def test_offset_changes_tzstr_and_fixed_offset():
+    timezone = tz.tzstr('EST5EDT,M3.2.0,M11.1.0', posix_offset=True)
+
+    changes = list(tz.iter_offset_changes(
+        timezone,
+        datetime(2020, 1, 1, tzinfo=tz.UTC),
+        datetime(2021, 1, 1, tzinfo=tz.UTC)))
+
+    assert changes == [
+        tz.OffsetChange(
+            datetime(2020, 3, 8, 7, tzinfo=tz.UTC),
+            timedelta(hours=-5), timedelta(hours=-4), 'EST', 'EDT'),
+        tz.OffsetChange(
+            datetime(2020, 11, 1, 6, tzinfo=tz.UTC),
+            timedelta(hours=-4), timedelta(hours=-5), 'EDT', 'EST'),
+    ]
+
+    assert list(tz.iter_offset_changes(
+        tz.tzoffset('FIXED', 1800),
+        datetime(2020, 1, 1, tzinfo=tz.UTC),
+        datetime(2021, 1, 1, tzinfo=tz.UTC))) == []
+
+
+def test_offset_changes_interval_inputs():
+    timezone = tz.tzstr('EST5EDT,M3.2.0,M11.1.0', posix_offset=True)
+    start = datetime(2020, 3, 8, 7, tzinfo=tz.UTC)
+
+    aware_changes = list(timezone.offset_changes(
+        start.astimezone(tz.tzoffset('+02:00', 7200)),
+        start + timedelta(seconds=1)))
+    naive_changes = list(timezone.offset_changes(
+        start.replace(tzinfo=None),
+        (start + timedelta(seconds=1)).replace(tzinfo=None)))
+
+    assert aware_changes == naive_changes == [
+        tz.OffsetChange(start, timedelta(hours=-5),
+                        timedelta(hours=-4), 'EST', 'EDT')]
+
+    with pytest.raises(TypeError):
+        list(tz.iter_offset_changes(timezone, '2020-01-01', start))
+
+    with pytest.raises(ValueError):
+        list(tz.iter_offset_changes(timezone, start,
+                                    start - timedelta(seconds=1)))
+
+
+def test_offset_changes_tzfile_posix_future_rule():
+    transition_ts = 1562070000
+    timezone = tz.tzfile(BytesIO(_tzif_v2(
+        [transition_ts],
+        [(-18000, 0, 0), (-14400, 1, 4)],
+        [b'OLD', b'NEW'],
+        b'OLD5NEW4,M1.1.0/0,M7.1.0')))
+
+    start = datetime(2040, 1, 1, tzinfo=tz.UTC)
+    end = datetime(2040, 7, 2, tzinfo=tz.UTC)
+    changes = list(tz.iter_offset_changes(timezone, start, end))
+
+    assert changes == [
+        tz.OffsetChange(
+            datetime(2040, 1, 1, 5, tzinfo=tz.UTC),
+            timedelta(hours=-5), timedelta(hours=-4),
+            'OLD', 'NEW'),
+        tz.OffsetChange(
+            datetime(2040, 7, 1, 6, tzinfo=tz.UTC),
+            timedelta(hours=-4), timedelta(hours=-5),
+            'NEW', 'OLD'),
+    ]
+
+    transition = changes[0].transition
+    before = timezone.fromutc((transition - timedelta(seconds=1))
+                              .replace(tzinfo=timezone))
+    after = timezone.fromutc((transition + timedelta(seconds=1))
+                             .replace(tzinfo=timezone))
+
+    assert before == datetime(2039, 12, 31, 23, 59, 59,
+                              tzinfo=timezone)
+    assert before.utcoffset() == timedelta(hours=-5)
+    assert before.tzname() == 'OLD'
+    assert after == datetime(2040, 1, 1, 1, 0, 1,
+                             tzinfo=timezone)
+    assert after.utcoffset() == timedelta(hours=-4)
+    assert after.tzname() == 'NEW'
+
+
+def test_offset_changes_tzfile_explicit_and_half_open_boundary():
+    transition_ts = 1577836800
+    timezone = tz.tzfile(BytesIO(_tzif_v2(
+        [transition_ts],
+        [(-18000, 0, 0), (-16200, 1, 4)],
+        [b'OLD', b'NEW'],
+        b'OLD5NEW4,M1.1.0/0,M7.1.0')))
+
+    transition = datetime(2020, 1, 1, tzinfo=tz.UTC)
+
+    assert list(timezone.offset_changes(transition,
+                                        transition + timedelta(days=1)))
+    assert list(timezone.offset_changes(transition - timedelta(seconds=1),
+                                        transition)) == []
+
+    before = timezone.fromutc((transition - timedelta(seconds=1))
+                              .replace(tzinfo=timezone))
+    after = timezone.fromutc((transition + timedelta(seconds=1))
+                             .replace(tzinfo=timezone))
+
+    assert before.utcoffset() == timedelta(hours=-5)
+    assert before.tzname() == 'OLD'
+    assert after.utcoffset() == timedelta(hours=-4, minutes=-30)
+    assert after.tzname() == 'NEW'
 
 
 @unittest.skipUnless(IS_WIN, "Requires Windows")

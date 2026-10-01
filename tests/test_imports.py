@@ -187,10 +187,13 @@ def test_import_tz_all():
     from dateutil.tz import datetime_ambiguous
     from dateutil.tz import datetime_exists
     from dateutil.tz import resolve_imaginary
+    from dateutil.tz import iter_offset_changes
+    from dateutil.tz import OffsetChange
 
     tz_all = ["tzutc", "tzoffset", "tzlocal", "tzfile", "tzrange",
               "tzstr", "tzical", "gettz", "datetime_ambiguous",
-              "datetime_exists", "resolve_imaginary", "UTC"]
+              "datetime_exists", "resolve_imaginary", "iter_offset_changes",
+              "OffsetChange", "UTC"]
 
     tz_all += ["tzwin", "tzwinlocal"] if sys.platform.startswith("win") else []
     lvars = locals()

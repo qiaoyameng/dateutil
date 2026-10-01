@@ -28,6 +28,10 @@ Functions
 
 .. autofunction:: resolve_imaginary
 
+.. autofunction:: iter_offset_changes
+
+.. autoclass:: OffsetChange
+
 
 Classes
 -------
