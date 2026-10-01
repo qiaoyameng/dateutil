@@ -349,6 +349,63 @@ class tzrangebase(_tzinfo):
 
         return enfold(dt_wall, fold=_fold)
 
+    def offset_changes(self, start, end):
+        from .tz import UTC, _make_offset_change
+
+        epoch = datetime(1970, 1, 1)
+
+        if not isinstance(start, datetime) or not isinstance(end, datetime):
+            raise TypeError("start and end must be datetime.datetime objects")
+
+        start = self._utc_datetime(start, UTC)
+        end = self._utc_datetime(end, UTC)
+
+        if end < start:
+            raise ValueError("end must be greater than or equal to start")
+
+        start_ts = (start - epoch).total_seconds()
+        end_ts = (end - epoch).total_seconds()
+
+        if not self.hasdst:
+            return iter(())
+
+        start_year = start.year - 1
+        end_year = end.year + 1
+        candidates = []
+
+        for year in range(start_year, end_year + 1):
+            dston, dstoff = self.transitions(year)
+
+            events = (
+                (dston - self._std_offset,
+                 self._std_offset, self._dst_offset,
+                 self._std_abbr, self._dst_abbr),
+                (dstoff - self._std_offset,
+                 self._dst_offset, self._std_offset,
+                 self._dst_abbr, self._std_abbr),
+            )
+
+            for wall, old_offset, new_offset, old_name, new_name in events:
+                timestamp = self._timestamp(wall)
+                if start_ts <= timestamp < end_ts:
+                    if old_offset != new_offset or old_name != new_name:
+                        candidates.append((timestamp, old_offset, new_offset,
+                                           old_name, new_name))
+
+        return iter(
+            _make_offset_change(*event)
+            for event in sorted(candidates, key=lambda event: event[0]))
+
+    @staticmethod
+    def _utc_datetime(dt, UTC):
+        if dt.tzinfo is not None:
+            dt = dt.astimezone(UTC).replace(tzinfo=None)
+        return dt
+
+    @staticmethod
+    def _timestamp(dt):
+        return (dt - datetime(1970, 1, 1)).total_seconds()
+
     def is_ambiguous(self, dt):
         """
         Whether or not the "wall time" of a given datetime is ambiguous in this

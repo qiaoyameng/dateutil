@@ -1,0 +1,3 @@
+Added ``dateutil.tz.offset_changes`` to iterate over offset and abbreviation
+changes in a UTC interval, including future transitions from TZif POSIX
+footers.

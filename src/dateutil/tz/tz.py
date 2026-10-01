@@ -14,7 +14,7 @@ import sys
 import os
 import bisect
 import weakref
-from collections import OrderedDict
+from collections import OrderedDict, namedtuple
 
 import six
 from six import string_types
@@ -36,6 +36,58 @@ from warnings import warn
 ZERO = datetime.timedelta(0)
 EPOCH = datetime.datetime(1970, 1, 1, 0, 0)
 EPOCHORDINAL = EPOCH.toordinal()
+
+
+class TZOffsetChange(namedtuple(
+        'TZOffsetChangeBase',
+        ['utc', 'old_offset', 'new_offset', 'old_name', 'new_name'])):
+    """
+    An offset or abbreviation change in a :class:`datetime.tzinfo`.
+
+    :ivar utc:
+        The UTC instant at which the change takes effect, represented as a
+        time zone-aware :class:`datetime.datetime`.
+    :ivar old_offset:
+        The UTC offset in effect immediately before :attr:`utc`.
+    :ivar new_offset:
+        The UTC offset in effect at and after :attr:`utc`.
+    :ivar old_name:
+        The time zone abbreviation in effect immediately before :attr:`utc`.
+    :ivar new_name:
+        The time zone abbreviation in effect at and after :attr:`utc`.
+    """
+
+    __slots__ = ()
+
+
+def _interval_timestamps(start, end):
+    if not isinstance(start, datetime.datetime):
+        raise TypeError("start must be a datetime.datetime")
+    if not isinstance(end, datetime.datetime):
+        raise TypeError("end must be a datetime.datetime")
+
+    def timestamp(dt):
+        if dt.tzinfo is not None:
+            dt = dt.astimezone(UTC).replace(tzinfo=None)
+
+        return (dt - EPOCH).total_seconds()
+
+    start_ts = timestamp(start)
+    end_ts = timestamp(end)
+
+    if end_ts < start_ts:
+        raise ValueError("end must be greater than or equal to start")
+
+    return start_ts, end_ts
+
+
+def _timestamp_to_utc(timestamp):
+    return EPOCH + datetime.timedelta(seconds=timestamp)
+
+
+def _make_offset_change(timestamp, old_offset, new_offset, old_name, new_name):
+    return TZOffsetChange(_timestamp_to_utc(timestamp).replace(tzinfo=UTC),
+                          old_offset, new_offset, old_name, new_name)
 
 
 @six.add_metaclass(_TzSingleton)
@@ -96,6 +148,11 @@ class tzutc(datetime.tzinfo):
         .. versionadded:: 2.6.0
         """
         return False
+
+    def offset_changes(self, start, end):
+        """Yield no changes; UTC is a fixed-offset time zone."""
+        _interval_timestamps(start, end)
+        return iter(())
 
     @_validate_fromutc_inputs
     def fromutc(self, dt):
@@ -178,6 +235,11 @@ class tzoffset(datetime.tzinfo):
         .. versionadded:: 2.6.0
         """
         return False
+
+    def offset_changes(self, start, end):
+        """Yield no changes; this is a fixed-offset time zone."""
+        _interval_timestamps(start, end)
+        return iter(())
 
     def __eq__(self, other):
         if not isinstance(other, tzoffset):
@@ -376,7 +438,8 @@ class _tzfile(object):
     information read from binary tzfiles.
     """
     attrs = ['trans_list', 'trans_list_utc', 'trans_idx', 'ttinfo_list',
-             'ttinfo_std', 'ttinfo_dst', 'ttinfo_before', 'ttinfo_first']
+             'ttinfo_std', 'ttinfo_dst', 'ttinfo_before', 'ttinfo_first',
+             'posix_str']
 
     def __init__(self, **kwargs):
         for attr in self.attrs:
@@ -486,7 +549,29 @@ class tzfile(_tzinfo):
             setattr(self, '_' + attr, getattr(tzobj, attr))
 
     def _read_tzfile(self, fileobj):
+        magic = fileobj.read(4)
+        if magic != b"TZif":
+            raise ValueError("magic not found")
+
+        fileobj.read(16)
+
+        out = self._read_tzfile_block(fileobj)
+
+        if fileobj.read(4) == b"TZif":
+            fileobj.read(16)
+            out = self._read_tzfile_block(fileobj, use64=True)
+
+            footer = fileobj.read()
+            if footer.startswith(b"\n"):
+                out.posix_str = footer.strip().decode()
+
+        return out
+
+    def _read_tzfile_block(self, fileobj, use64=False):
         out = _tzfile()
+
+        time_format = "q" if use64 else "l"
+        time_size = 8 if use64 else 4
 
         # From tzfile(5):
         #
@@ -497,11 +582,6 @@ class tzfile(_tzinfo):
         # six four-byte values of type long, written in a
         # ``standard'' byte order (the high-order  byte
         # of the value is written first).
-        if fileobj.read(4).decode() != "TZif":
-            raise ValueError("magic not found")
-
-        fileobj.read(16)
-
         (
             # The number of UTC/local indicators stored in the file.
             ttisgmtcnt,
@@ -535,8 +615,9 @@ class tzfile(_tzinfo):
         # change.
 
         if timecnt:
-            out.trans_list_utc = list(struct.unpack(">%dl" % timecnt,
-                                                    fileobj.read(timecnt*4)))
+            out.trans_list_utc = list(
+                struct.unpack(">%d%s" % (timecnt, time_format),
+                              fileobj.read(timecnt * time_size)))
         else:
             out.trans_list_utc = []
 
@@ -582,7 +663,7 @@ class tzfile(_tzinfo):
 
         # Not used, for now (but seek for correct file position)
         if leapcnt:
-            fileobj.seek(leapcnt * 8, os.SEEK_CUR)
+            fileobj.seek(leapcnt * time_size * 2, os.SEEK_CUR)
 
         # Then there are tzh_ttisstdcnt standard/wall
         # indicators, each stored as a one-byte value;
@@ -626,10 +707,8 @@ class tzfile(_tzinfo):
         # Replace ttinfo indexes for ttinfo objects.
         out.trans_idx = [out.ttinfo_list[idx] for idx in out.trans_idx]
 
-        # Set standard, dst, and before ttinfos. before will be
-        # used when a given time is before any transitions,
-        # and will be set to the first non-dst ttinfo, or to
-        # the first dst, if all of them are dst.
+        # Set standard, dst, and before ttinfos. Before the first
+        # transition, TZif specifies that local time type 0 is in effect.
         out.ttinfo_std = None
         out.ttinfo_dst = None
         out.ttinfo_before = None
@@ -637,6 +716,7 @@ class tzfile(_tzinfo):
             if not out.trans_list_utc:
                 out.ttinfo_std = out.ttinfo_first = out.ttinfo_list[0]
             else:
+                out.ttinfo_first = out.ttinfo_list[0]
                 for i in range(timecnt-1, -1, -1):
                     tti = out.trans_idx[i]
                     if not out.ttinfo_std and not tti.isdst:
@@ -650,12 +730,7 @@ class tzfile(_tzinfo):
                     if out.ttinfo_dst and not out.ttinfo_std:
                         out.ttinfo_std = out.ttinfo_dst
 
-                for tti in out.ttinfo_list:
-                    if not tti.isdst:
-                        out.ttinfo_before = tti
-                        break
-                else:
-                    out.ttinfo_before = out.ttinfo_list[0]
+                out.ttinfo_before = out.ttinfo_list[0]
 
         # Now fix transition times to become relative to wall time.
         #
@@ -736,6 +811,10 @@ class tzfile(_tzinfo):
         return self._trans_idx[idx]
 
     def _find_ttinfo(self, dt):
+        rule = self._get_posix_tz()
+        if rule is not None and self._uses_posix_rules(dt, rule):
+            return self._get_rule_ttinfo(rule, dt)
+
         idx = self._resolve_ambiguous_time(dt)
 
         return self._get_ttinfo(idx)
@@ -768,6 +847,12 @@ class tzfile(_tzinfo):
 
         # First treat UTC as wall time and get the transition we're in.
         idx = self._find_last_transition(dt, in_utc=True)
+        rule = self._get_posix_tz()
+        if self._uses_posix_rules(dt, rule, in_utc=True):
+            dt_out = rule.fromutc(dt.replace(tzinfo=rule))
+            return enfold(dt_out.replace(tzinfo=self),
+                          fold=getattr(dt_out, 'fold', 0))
+
         tti = self._get_ttinfo(idx)
 
         dt_out = dt + datetime.timedelta(seconds=tti.offset)
@@ -793,6 +878,10 @@ class tzfile(_tzinfo):
         if idx is None:
             idx = self._find_last_transition(dt)
 
+        rule = self._get_posix_tz()
+        if rule is not None and self._uses_posix_rules(dt, rule):
+            return rule.is_ambiguous(dt)
+
         # Calculate the difference in offsets from current to previous
         timestamp = _datetime_to_timestamp(dt)
         tti = self._get_ttinfo(idx)
@@ -804,6 +893,139 @@ class tzfile(_tzinfo):
         tt = self._trans_list[idx]          # Transition time
 
         return timestamp < tt + od
+
+    def _get_posix_tz(self):
+        if not getattr(self, '_posix_str', None):
+            return None
+
+        if not hasattr(self, '_posix_tz'):
+            try:
+                rule = self._posix_str
+                names = []
+
+                while '<' in rule:
+                    start = rule.find('<')
+                    end = rule.find('>', start)
+                    if end < 0:
+                        raise ValueError
+
+                    names.append(rule[start + 1:end])
+                    rule = (rule[:start] + chr(ord('A') + len(names) - 1)
+                            + rule[end + 1:])
+
+                self._posix_tz = tzstr(rule, posix_offset=True)
+
+                if names:
+                    self._posix_tz._std_abbr = names[0]
+                    if len(names) > 1:
+                        self._posix_tz._dst_abbr = names[1]
+            except ValueError:
+                self._posix_tz = None
+
+        return self._posix_tz
+
+    def _get_rule_ttinfo(self, rule, dt):
+        tti = _ttinfo()
+        if rule._isdst(dt):
+            tti.offset = int(rule._dst_offset.total_seconds())
+            tti.delta = rule._dst_offset
+            tti.isdst = 1
+            tti.abbr = rule._dst_abbr
+            tti.dstoffset = rule._dst_base_offset
+        else:
+            tti.offset = int(rule._std_offset.total_seconds())
+            tti.delta = rule._std_offset
+            tti.isdst = 0
+            tti.abbr = rule._std_abbr
+            tti.dstoffset = ZERO
+
+        return tti
+
+    def _uses_posix_rules(self, dt, rule=None, in_utc=False):
+        if rule is None:
+            rule = self._get_posix_tz()
+
+        if rule is None or not self._trans_list:
+            return False
+
+        idx = self._find_last_transition(dt, in_utc=in_utc)
+        return idx is not None and idx + 1 >= len(self._trans_list)
+
+    def offset_changes(self, start, end):
+        _interval_timestamps(start, end)
+        return self._iter_offset_changes(start, end)
+
+    def _iter_offset_changes(self, start, end):
+        """
+        Yield explicit TZif changes and future changes from its POSIX rules.
+
+        The query interval is half-open: it contains a change at ``start`` and
+        excludes a change at ``end``. Naive datetimes are interpreted as UTC.
+        Future annual changes are generated from the TZif footer, so they are
+        available beyond the file's final explicit transition without scanning
+        the time line.
+        """
+        start_ts, end_ts = _interval_timestamps(start, end)
+
+        for idx, timestamp in enumerate(self._trans_list_utc):
+            if idx == 0:
+                old_tti = self._ttinfo_list[0]
+            else:
+                old_tti = self._trans_idx[idx - 1]
+            new_tti = self._trans_idx[idx]
+
+            if start_ts <= timestamp < end_ts:
+                if (old_tti.delta != new_tti.delta or
+                        old_tti.abbr != new_tti.abbr):
+                    yield _make_offset_change(timestamp,
+                                              old_tti.delta, new_tti.delta,
+                                              old_tti.abbr, new_tti.abbr)
+
+        rule = self._get_posix_tz()
+        if rule is None or not self._trans_list_utc:
+            return
+
+        cutoff = self._trans_list_utc[-1]
+        start_dt = _timestamp_to_utc(start_ts)
+        end_dt = _timestamp_to_utc(end_ts)
+        old_tti = self._trans_idx[-1]
+        cutoff_wall = rule.fromutc(
+            _timestamp_to_utc(cutoff).replace(tzinfo=rule))
+        cutoff_tti = self._get_rule_ttinfo(rule, cutoff_wall)
+
+        if start_ts <= cutoff < end_ts:
+            if (old_tti.delta != cutoff_tti.delta or
+                    old_tti.abbr != cutoff_tti.abbr):
+                yield _make_offset_change(cutoff, old_tti.delta,
+                                          cutoff_tti.delta, old_tti.abbr,
+                                          cutoff_tti.abbr)
+
+        if not rule.hasdst:
+            return
+
+        candidates = []
+
+        for year in range(start_dt.year - 1, end_dt.year + 2):
+            dston, dstoff = rule.transitions(year)
+
+            events = (
+                (dston - rule._std_offset,
+                 rule._std_offset, rule._dst_offset,
+                 rule._std_abbr, rule._dst_abbr),
+                (dstoff - rule._std_offset,
+                 rule._dst_offset, rule._std_offset,
+                 rule._dst_abbr, rule._std_abbr),
+            )
+
+            for wall, old_offset, new_offset, old_name, new_name in events:
+                timestamp = _datetime_to_timestamp(wall)
+                if (timestamp > cutoff and
+                        start_ts <= timestamp < end_ts):
+                    candidates.append((timestamp, old_offset, new_offset,
+                                       old_name, new_name))
+
+        for event in sorted(candidates, key=lambda event: event[0]):
+            yield _make_offset_change(*event)
 
     def _resolve_ambiguous_time(self, dt):
         idx = self._find_last_transition(dt)
@@ -831,9 +1053,6 @@ class tzfile(_tzinfo):
         if dt is None:
             return None
 
-        if not self._ttinfo_dst:
-            return ZERO
-
         tti = self._find_ttinfo(dt)
 
         if not tti.isdst:
@@ -852,7 +1071,9 @@ class tzfile(_tzinfo):
     def __eq__(self, other):
         if not isinstance(other, tzfile):
             return NotImplemented
-        return (self._trans_list == other._trans_list and
+        return (getattr(self, '_posix_str', None) ==
+                getattr(other, '_posix_str', None) and
+                self._trans_list == other._trans_list and
                 self._trans_idx == other._trans_idx and
                 self._ttinfo_list == other._ttinfo_list)
 
@@ -1804,6 +2025,39 @@ def resolve_imaginary(dt):
         dt += curr_offset - old_offset
 
     return dt
+
+
+def offset_changes(tz, start, end):
+    """
+    Iterate over offset changes in a time zone over a UTC interval.
+
+    The interval is half-open: a change exactly at ``start`` is included and
+    a change exactly at ``end`` is excluded. Naive ``start`` and ``end``
+    values are interpreted as UTC. Each result is a :class:`TZOffsetChange`
+    containing the UTC transition instant and the offsets and abbreviations
+    immediately before and after it.
+
+    Supported time zones include :class:`tzfile`, :class:`tzrange`,
+    :class:`tzstr`, :class:`tzoffset`, and :class:`tzutc`. For a
+    :class:`tzfile`, changes after its explicit transition list are generated
+    from the POSIX rules stored in the TZif footer.
+
+    :param tz:
+        The time zone to query.
+    :param start:
+        Start of the UTC interval (inclusive).
+    :param end:
+        End of the UTC interval (exclusive).
+    """
+    if hasattr(datetime, 'timezone') and isinstance(tz, datetime.timezone):
+        _interval_timestamps(start, end)
+        return iter(())
+
+    changes = getattr(tz, 'offset_changes', None)
+    if not callable(changes):
+        raise TypeError("Unsupported time zone type: %r" % (tz,))
+
+    return iter(changes(start, end))
 
 
 def _datetime_to_timestamp(dt):

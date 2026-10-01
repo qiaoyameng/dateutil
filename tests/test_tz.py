@@ -5,10 +5,15 @@ import base64
 import copy
 import gc
 import os
+import struct
 import sys
 import unittest
 import weakref
 from datetime import datetime
+try:
+    from datetime import timezone as dt_timezone
+except ImportError:
+    dt_timezone = None
 from datetime import time as dt_time
 from datetime import timedelta, tzinfo
 from functools import partial
@@ -2813,3 +2818,241 @@ def test_resolve_imaginary(tzi, dt, dt_exp):
     assert dt_r == dt_exp
     assert dt_r.tzname() == dt_exp.tzname()
     assert dt_r.utcoffset() == dt_exp.utcoffset()
+
+
+def _tzif_timestamp(year, month, day, hour=0, minute=0, second=0):
+    dt = datetime(year, month, day, hour, minute, second)
+    return int((dt - datetime(1970, 1, 1)).total_seconds())
+
+
+def _tzif_block(timestamps, type_indices, ttinfos, use64=False, footer=None):
+    time_format = 'q' if use64 else 'l'
+    abbreviations = b''
+    abbreviation_indices = {}
+    ttinfo_blocks = []
+
+    for offset, isdst, abbreviation in ttinfos:
+        if abbreviation not in abbreviation_indices:
+            abbreviation_indices[abbreviation] = len(abbreviations)
+            abbreviations += abbreviation.encode('ascii') + b'\0'
+
+        ttinfo_blocks.append(struct.pack(
+            '>lbb', offset, isdst,
+            abbreviation_indices[abbreviation]))
+
+    header = struct.pack(
+        '>6l', 0, 0, 0, len(timestamps), len(ttinfos),
+        len(abbreviations))
+    transitions = struct.pack(
+        '>%d%s' % (len(timestamps), time_format), *timestamps)
+    block = (
+        b'TZif' + (b'2' if use64 else b'\0') + b'\0' * 15 +
+        header + transitions + bytes(type_indices) +
+        b''.join(ttinfo_blocks) + abbreviations)
+
+    if use64:
+        block += b'\n' + footer.encode('ascii') + b'\n'
+
+    return block
+
+
+def _tzif_file(timestamps, type_indices, ttinfos, footer=None):
+    v1 = _tzif_block(timestamps, type_indices, ttinfos)
+    if footer is None:
+        return BytesIO(v1)
+
+    v2 = _tzif_block(timestamps, type_indices, ttinfos,
+                     use64=True, footer=footer)
+    return BytesIO(v1 + v2)
+
+
+def _local_at(tzi, utc_naive):
+    return tzi.fromutc(utc_naive.replace(tzinfo=tzi))
+
+
+def test_offset_changes_fixed_offsets():
+    start = datetime(2020, 1, 1)
+    end = datetime(2021, 1, 1)
+
+    assert list(tz.offset_changes(tz.UTC, start, end)) == []
+    assert list(tz.offset_changes(tz.tzoffset('X', 1800), start, end)) == []
+    if dt_timezone is not None:
+        assert list(tz.offset_changes(
+            dt_timezone(timedelta(hours=2)), start, end)) == []
+
+
+def test_offset_changes_validates_interval():
+    start = datetime(2020, 1, 1)
+    end = datetime(2021, 1, 1)
+
+    with pytest.raises(ValueError):
+        tz.offset_changes(tz.UTC, end, start)
+
+    with pytest.raises(TypeError):
+        tz.offset_changes(tz.UTC, None, end)
+
+    with pytest.raises(TypeError):
+        tz.offset_changes(tz.UTC, start, None)
+
+    with pytest.raises(TypeError):
+        tz.offset_changes(tzinfo(), start, end)
+
+    tzif_zone = tz.tzfile(_tzif_file([], [], [(0, 0, 'X')]))
+    with pytest.raises(ValueError):
+        tzif_zone.offset_changes(end, start)
+
+
+def test_offset_changes_tzstr_half_hour_and_bounds():
+    zone = tz.tzstr(
+        'X-5:30Y-6,M3.2.0/2,M11.1.0/2',
+        posix_offset=True)
+    spring = datetime(2020, 3, 7, 20, 30, tzinfo=tz.UTC)
+    fall = datetime(2020, 10, 31, 20, 0, tzinfo=tz.UTC)
+
+    changes = list(tz.offset_changes(zone, spring, fall))
+
+    assert len(changes) == 1
+    assert changes[0].utc == spring
+    assert changes[0].old_offset == timedelta(hours=5, minutes=30)
+    assert changes[0].new_offset == timedelta(hours=6)
+    assert (changes[0].old_name, changes[0].new_name) == ('X', 'Y')
+
+    assert len(list(tz.offset_changes(zone, spring, spring))) == 0
+    assert len(list(tz.offset_changes(zone, fall, datetime(2021, 1, 1)))) == 1
+
+
+def test_offset_changes_name_only_tzrange():
+    zone = tz.tzrange(
+        'A', 0, 'B', 0,
+        start=relativedelta(hours=2, month=3, day=1),
+        end=relativedelta(hours=2, month=11, day=1))
+    transition = datetime(2020, 3, 1, 2, tzinfo=tz.UTC)
+
+    changes = list(tz.offset_changes(
+        zone, datetime(2020, 1, 1), datetime(2021, 1, 1)))
+
+    assert [change.utc for change in changes] == [
+        transition,
+        datetime(2020, 11, 1, 2, tzinfo=tz.UTC)]
+    assert all(change.old_offset == change.new_offset for change in changes)
+    assert changes[0].old_name == 'A'
+    assert changes[0].new_name == 'B'
+
+
+def test_offset_changes_tzif_explicit_half_hour_and_name_only():
+    half_hour = _tzif_timestamp(2020, 3, 8)
+    name_only = _tzif_timestamp(2020, 3, 9)
+    ttinfos = [
+        (18000, 0, 'X'),
+        (19800, 1, 'Y'),
+        (19800, 0, 'Z'),
+    ]
+    zone = tz.tzfile(_tzif_file(
+        [half_hour, name_only], [1, 2], ttinfos))
+
+    changes = list(tz.offset_changes(
+        zone, datetime(2020, 1, 1), datetime(2021, 1, 1)))
+
+    assert len(changes) == 2
+    assert changes[0].utc == datetime(2020, 3, 8, tzinfo=tz.UTC)
+    assert changes[0].old_offset == timedelta(hours=5)
+    assert changes[0].new_offset == timedelta(hours=5, minutes=30)
+    assert changes[0].old_name == 'X'
+    assert changes[0].new_name == 'Y'
+
+    assert changes[1].old_offset == changes[1].new_offset
+    assert changes[1].old_name == 'Y'
+    assert changes[1].new_name == 'Z'
+
+    transition = datetime(2020, 3, 8)
+    before = _local_at(zone, transition - timedelta(seconds=1))
+    at = _local_at(zone, transition)
+    after = _local_at(zone, transition + timedelta(seconds=1))
+
+    assert before.replace(tzinfo=None) == datetime(2020, 3, 8, 4, 59, 59)
+    assert at.replace(tzinfo=None) == datetime(2020, 3, 8, 5, 30)
+    assert after.replace(tzinfo=None) == datetime(2020, 3, 8, 5, 30, 1)
+    assert (before.utcoffset(), before.tzname()) == (
+        timedelta(hours=5), 'X')
+    assert (at.utcoffset(), at.tzname()) == (
+        timedelta(hours=5, minutes=30), 'Y')
+    assert (after.utcoffset(), after.tzname()) == (
+        timedelta(hours=5, minutes=30), 'Y')
+
+    name_transition = datetime(2020, 3, 9)
+    before = _local_at(zone, name_transition - timedelta(seconds=1))
+    at = _local_at(zone, name_transition)
+    after = _local_at(zone, name_transition + timedelta(seconds=1))
+
+    assert before.replace(tzinfo=None) == datetime(2020, 3, 9, 5, 29, 59)
+    assert at.replace(tzinfo=None) == datetime(2020, 3, 9, 5, 30)
+    assert after.replace(tzinfo=None) == datetime(2020, 3, 9, 5, 30, 1)
+    assert before.tzname() == 'Y'
+    assert at.tzname() == 'Z'
+    assert after.tzname() == 'Z'
+
+
+def test_offset_changes_tzif_future_posix_rules():
+    cutoff = _tzif_timestamp(2018, 3, 10, 20, 30)
+    ttinfos = [
+        (19800, 0, 'X'),
+        (21600, 1, 'Y'),
+    ]
+    footer = '<X>-5:30<Y>-6,M3.2.0/2,M11.1.0/2'
+    zone = tz.tzfile(_tzif_file(
+        [cutoff], [1], ttinfos, footer=footer))
+
+    spring = datetime(2020, 3, 7, 20, 30)
+    fall = datetime(2020, 10, 31, 20, 0)
+    changes = list(tz.offset_changes(
+        zone, datetime(2020, 1, 1), datetime(2021, 1, 1)))
+
+    assert [change.utc.replace(tzinfo=None) for change in changes] == [
+        spring, fall]
+    assert changes[0].old_offset == timedelta(hours=5, minutes=30)
+    assert changes[0].new_offset == timedelta(hours=6)
+    assert changes[1].old_offset == timedelta(hours=6)
+    assert changes[1].new_offset == timedelta(hours=5, minutes=30)
+
+    before = _local_at(zone, spring - timedelta(seconds=1))
+    at = _local_at(zone, spring)
+    after = _local_at(zone, spring + timedelta(seconds=1))
+
+    assert before.replace(tzinfo=None) == datetime(2020, 3, 8, 1, 59, 59)
+    assert at.replace(tzinfo=None) == datetime(2020, 3, 8, 2, 30)
+    assert after.replace(tzinfo=None) == datetime(2020, 3, 8, 2, 30, 1)
+    assert before.utcoffset() == timedelta(hours=5, minutes=30)
+    assert at.utcoffset() == timedelta(hours=6)
+    assert after.utcoffset() == timedelta(hours=6)
+
+    before = _local_at(zone, fall - timedelta(seconds=1))
+    at = _local_at(zone, fall)
+    after = _local_at(zone, fall + timedelta(seconds=1))
+
+    assert before.replace(tzinfo=None) == datetime(2020, 11, 1, 1, 59, 59)
+    assert at.replace(tzinfo=None) == datetime(2020, 11, 1, 1, 30)
+    assert after.replace(tzinfo=None) == datetime(2020, 11, 1, 1, 30, 1)
+    assert before.utcoffset() == timedelta(hours=6)
+    assert at.utcoffset() == timedelta(hours=5, minutes=30)
+    assert after.utcoffset() == timedelta(hours=5, minutes=30)
+    assert at.fold == 1
+
+
+def test_offset_changes_tzif_future_fixed_posix_rule():
+    cutoff = _tzif_timestamp(2030, 1, 1)
+    ttinfos = [
+        (3600, 1, 'D'),
+        (0, 0, 'S'),
+    ]
+    zone = tz.tzfile(_tzif_file(
+        [cutoff], [1], ttinfos, footer='<S>0'))
+
+    changes = list(tz.offset_changes(
+        zone, datetime(2029, 1, 1), datetime(2031, 1, 1)))
+
+    assert len(changes) == 1
+    assert changes[0].utc == datetime(2030, 1, 1, tzinfo=tz.UTC)
+    assert changes[0].old_offset == timedelta(hours=1)
+    assert changes[0].new_offset == timedelta(0)
+    assert changes[0].old_name == 'D'
+    assert changes[0].new_name == 'S'

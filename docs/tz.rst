@@ -28,6 +28,11 @@ Functions
 
 .. autofunction:: resolve_imaginary
 
+.. autofunction:: offset_changes
+
+.. autoclass:: TZOffsetChange
+    :members:
+
 
 Classes
 -------
