@@ -3,12 +3,14 @@ from __future__ import unicode_literals
 from ._common import NotAValue
 
 import calendar
-from datetime import datetime, date, timedelta
+from datetime import datetime, date, timedelta, timezone
 import unittest
 
 import pytest
 
-from dateutil.relativedelta import relativedelta, MO, TU, WE, FR, SU
+from dateutil.relativedelta import (
+    relativedelta, DayOverflow, MO, TU, WE, FR, SU
+)
 
 
 class RelativeDeltaTest(unittest.TestCase):
@@ -711,6 +713,167 @@ class RelativeDeltaTest(unittest.TestCase):
             date(2021, 4, 30),
             date(2021, 5, 30),
         ]
+
+
+class DayOverflowTest(unittest.TestCase):
+    def test_default_is_last_day(self):
+        self.assertEqual(
+            date(2020, 1, 31) + relativedelta(months=1),
+            date(2020, 2, 29)
+        )
+
+    def test_explicit_last_day(self):
+        delta = relativedelta(
+            months=1,
+            day_overflow=DayOverflow.LAST_DAY
+        )
+        self.assertEqual(
+            date(2019, 1, 31) + delta,
+            date(2019, 2, 28)
+        )
+
+    def test_raise_leaves_original_date_usable(self):
+        original = date(2019, 1, 31)
+        delta = relativedelta(
+            months=1,
+            day_overflow=DayOverflow.RAISE
+        )
+
+        with self.assertRaises(ValueError):
+            original + delta
+
+        self.assertEqual(original, date(2019, 1, 31))
+        self.assertEqual(original + relativedelta(months=1),
+                         date(2019, 2, 28))
+
+    def test_overflow_in_leap_year(self):
+        delta = relativedelta(
+            months=1,
+            day_overflow=DayOverflow.OVERFLOW
+        )
+
+        self.assertEqual(date(2020, 1, 31) + delta, date(2020, 3, 2))
+        self.assertEqual(date(2019, 1, 31) + delta, date(2019, 3, 3))
+
+    def test_overflow_negative_month(self):
+        delta = relativedelta(
+            months=-1,
+            day_overflow=DayOverflow.OVERFLOW
+        )
+
+        self.assertEqual(date(2020, 3, 31) + delta, date(2020, 3, 2))
+        self.assertEqual(date(2019, 3, 31) + delta, date(2019, 3, 3))
+
+    def test_overflow_absolute_day(self):
+        delta = relativedelta(month=2, day=30,
+                              day_overflow=DayOverflow.OVERFLOW)
+
+        self.assertEqual(date(2019, 6, 15) + delta, date(2019, 3, 2))
+
+    def test_calendar_order_day_then_relative_days_then_weekday(self):
+        delta = relativedelta(
+            months=1,
+            days=1,
+            weekday=MO(1),
+            day_overflow=DayOverflow.OVERFLOW
+        )
+
+        self.assertEqual(date(2019, 1, 31) + delta, date(2019, 3, 4))
+
+    def test_two_one_month_steps_differ_from_one_two_month_step(self):
+        one_month = relativedelta(
+            months=1,
+            day_overflow=DayOverflow.OVERFLOW
+        )
+        two_months = relativedelta(
+            months=2,
+            day_overflow=DayOverflow.OVERFLOW
+        )
+
+        self.assertEqual(date(2020, 1, 31) + one_month + one_month,
+                         date(2020, 4, 2))
+        self.assertEqual(date(2020, 1, 31) + two_months,
+                         date(2020, 3, 31))
+
+    def test_timezone_aware_overflow_preserves_wall_time(self):
+        original = datetime(2020, 1, 31, 13, 45,
+                            tzinfo=timezone(timedelta(hours=5)))
+        delta = relativedelta(
+            months=1,
+            day_overflow=DayOverflow.OVERFLOW
+        )
+
+        result = original + delta
+
+        self.assertEqual(result.replace(tzinfo=None),
+                         datetime(2020, 3, 2, 13, 45))
+        self.assertEqual(result.tzinfo.utcoffset(result),
+                         timedelta(hours=5))
+
+    def test_invalid_strategy(self):
+        with self.assertRaises(ValueError):
+            relativedelta(months=1, day_overflow="not-a-strategy")
+
+    def test_strategy_is_preserved(self):
+        delta = relativedelta(
+            months=1,
+            day_overflow=DayOverflow.OVERFLOW
+        )
+
+        self.assertEqual(delta, relativedelta(
+            months=1,
+            day_overflow=DayOverflow.OVERFLOW
+        ))
+        self.assertEqual(-delta, relativedelta(
+            months=-1,
+            day_overflow=DayOverflow.OVERFLOW
+        ))
+        self.assertEqual(2 * delta, relativedelta(
+            months=2,
+            day_overflow=DayOverflow.OVERFLOW
+        ))
+        self.assertEqual(
+            repr(delta),
+            "relativedelta(months=+1, day_overflow='overflow')"
+        )
+
+    def test_two_date_delta_roundtrip(self):
+        original = date(2020, 1, 31)
+        targets = [
+            date(2019, 2, 28),
+            date(2020, 2, 29),
+            date(2020, 3, 2),
+            date(2020, 3, 3),
+        ]
+        strategies = [
+            DayOverflow.LAST_DAY,
+            DayOverflow.RAISE,
+            DayOverflow.OVERFLOW,
+        ]
+
+        for strategy in strategies:
+            for target in targets:
+                with self.subTest(strategy=strategy, target=target):
+                    delta = relativedelta(target, original,
+                                          day_overflow=strategy)
+                    self.assertEqual(original + delta, target)
+
+    def test_delta_combination_keeps_explicit_strategy(self):
+        delta = (relativedelta(months=1) +
+                 relativedelta(days=2,
+                               day_overflow=DayOverflow.OVERFLOW))
+
+        self.assertEqual(delta, relativedelta(
+            months=1,
+            days=2,
+            day_overflow=DayOverflow.OVERFLOW
+        ))
+
+    def test_conflicting_strategies_cannot_be_combined(self):
+        with self.assertRaises(ValueError):
+            relativedelta(months=1, day_overflow=DayOverflow.OVERFLOW) + \
+                relativedelta(months=1, day_overflow=DayOverflow.RAISE)
+
 
 class RelativeDeltaWeeksPropertyGetterTest(unittest.TestCase):
     """Test the weeks property getter"""

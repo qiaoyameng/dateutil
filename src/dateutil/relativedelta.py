@@ -12,7 +12,30 @@ from ._common import weekday
 
 MO, TU, WE, TH, FR, SA, SU = weekdays = tuple(weekday(x) for x in range(7))
 
-__all__ = ["relativedelta", "MO", "TU", "WE", "TH", "FR", "SA", "SU"]
+__all__ = ["relativedelta", "DayOverflow",
+           "MO", "TU", "WE", "TH", "FR", "SA", "SU"]
+
+
+class DayOverflow(object):
+    """Strategies for resolving a day that does not exist in a month."""
+
+    LAST_DAY = "last_day"
+    RAISE = "raise"
+    OVERFLOW = "overflow"
+
+    CLAMP = LAST_DAY
+
+
+_DAY_OVERFLOW_VALUES = frozenset((
+    DayOverflow.LAST_DAY,
+    DayOverflow.RAISE,
+    DayOverflow.OVERFLOW,
+    "clamp",
+))
+
+_DAY_OVERFLOW_ALIASES = {
+    "clamp": DayOverflow.LAST_DAY,
+}
 
 
 class relativedelta(object):
@@ -67,24 +90,32 @@ class relativedelta(object):
             Set the yearday or the non-leap year day (jump leap days).
             These are converted to day/month/leapdays information.
 
+        day_overflow:
+            Defines what to do when the computed year and month do not
+            contain the computed day. ``DayOverflow.LAST_DAY`` (the
+            default) uses the final day of that month,
+            ``DayOverflow.RAISE`` raises a :class:`ValueError`, and
+            ``DayOverflow.OVERFLOW`` continues counting into the following
+            month.
+
     There are relative and absolute forms of the keyword
     arguments. The plural is relative, and the singular is
     absolute. For each argument in the order below, the absolute form
     is applied first (by setting each attribute to that value) and
     then the relative form (by adding the value to the attribute).
 
-    The order of attributes considered when this relativedelta is
-    added to a datetime is:
+    When a relativedelta is added to a datetime:
 
-    1. Year
-    2. Month
-    3. Day
-    4. Hours
-    5. Minutes
-    6. Seconds
-    7. Microseconds
+    1. The target year and month are computed from the absolute and relative
+       year and month values.
+    2. The absolute day is resolved in that month, using ``day_overflow`` if
+       the day does not exist.
+    3. Relative days, leap days, and relative or absolute time components are
+       applied.
+    4. Weekday is applied last.
 
-    Finally, weekday is applied, using the rule described above.
+    This ordering means that adding a one-month delta twice is not always
+    equivalent to adding a two-month delta once.
 
     For example
 
@@ -107,7 +138,10 @@ class relativedelta(object):
                  hours=0, minutes=0, seconds=0, microseconds=0,
                  year=None, month=None, day=None, weekday=None,
                  yearday=None, nlyearday=None,
-                 hour=None, minute=None, second=None, microsecond=None):
+                 hour=None, minute=None, second=None, microsecond=None,
+                 day_overflow=DayOverflow.LAST_DAY):
+
+        day_overflow = _validate_day_overflow(day_overflow)
 
         if dt1 and dt2:
             # datetime is a subclass of date. So both must be date
@@ -141,14 +175,11 @@ class relativedelta(object):
             self.second = None
             self.microsecond = None
             self._has_time = 0
+            self.day_overflow = day_overflow
 
             # Get year / month delta between the two
             months = (dt1.year - dt2.year) * 12 + (dt1.month - dt2.month)
             self._set_months(months)
-
-            # Remove the year/month delta so the timedelta is just well-defined
-            # time units (seconds, days and microseconds)
-            dtm = self.__radd__(dt2)
 
             # If we've overshot our target, make an adjustment
             if dt1 < dt2:
@@ -158,10 +189,28 @@ class relativedelta(object):
                 compare = operator.lt
                 increment = -1
 
+            while True:
+                try:
+                    # Remove the year/month delta so the timedelta is just
+                    # well-defined time units (seconds, days and microseconds)
+                    dtm = self.__radd__(dt2)
+                except ValueError:
+                    months += increment
+                    self._set_months(months)
+                else:
+                    break
+
             while compare(dt1, dtm):
                 months += increment
                 self._set_months(months)
-                dtm = self.__radd__(dt2)
+                while True:
+                    try:
+                        dtm = self.__radd__(dt2)
+                    except ValueError:
+                        months += increment
+                        self._set_months(months)
+                    else:
+                        break
 
             # Get the timedelta between the "months-adjusted" date and dt1
             delta = dt1 - dtm
@@ -191,6 +240,7 @@ class relativedelta(object):
             self.minute = minute
             self.second = second
             self.microsecond = microsecond
+            self.day_overflow = day_overflow
 
             if any(x is not None and int(x) != x
                    for x in (year, month, day, hour,
@@ -312,7 +362,17 @@ class relativedelta(object):
                               month=self.month, day=self.day,
                               weekday=self.weekday, hour=self.hour,
                               minute=self.minute, second=self.second,
-                              microsecond=self.microsecond)
+                              microsecond=self.microsecond,
+                              day_overflow=self.day_overflow)
+
+    @staticmethod
+    def _merge_day_overflow(left, right):
+        if right == DayOverflow.LAST_DAY:
+            return left
+        if left != DayOverflow.LAST_DAY and left != right:
+            raise ValueError("Cannot combine relativedelta objects with "
+                             "different day overflow strategies.")
+        return right
 
     def __add__(self, other):
         if isinstance(other, relativedelta):
@@ -341,7 +401,10 @@ class relativedelta(object):
                                          else self.second),
                                  microsecond=(other.microsecond if other.microsecond
                                               is not None else
-                                              self.microsecond))
+                                              self.microsecond),
+                                 day_overflow=self._merge_day_overflow(
+                                     self.day_overflow,
+                                     other.day_overflow))
         if isinstance(other, datetime.timedelta):
             return self.__class__(years=self.years,
                                   months=self.months,
@@ -358,7 +421,8 @@ class relativedelta(object):
                                   hour=self.hour,
                                   minute=self.minute,
                                   second=self.second,
-                                  microsecond=self.microsecond)
+                                  microsecond=self.microsecond,
+                                  day_overflow=self.day_overflow)
         if not isinstance(other, datetime.date):
             return NotImplemented
         elif self._has_time and not isinstance(other, datetime.datetime):
@@ -374,8 +438,23 @@ class relativedelta(object):
             elif month < 1:
                 year -= 1
                 month += 12
-        day = min(calendar.monthrange(year, month)[1],
-                  self.day or other.day)
+        day = self.day if self.day else other.day
+        days_in_month = calendar.monthrange(year, month)[1]
+        if day > days_in_month:
+            if self.day_overflow == DayOverflow.RAISE:
+                raise ValueError(
+                    "day %d is out of range for %04d-%02d" %
+                    (day, year, month))
+            elif self.day_overflow == DayOverflow.OVERFLOW:
+                overflow_date = (
+                    datetime.date(year, month, days_in_month) +
+                    datetime.timedelta(days=day - days_in_month)
+                )
+                year = overflow_date.year
+                month = overflow_date.month
+                day = overflow_date.day
+            else:
+                day = days_in_month
         repl = {"year": year, "month": month, "day": day}
         for attr in ["hour", "minute", "second", "microsecond"]:
             value = getattr(self, attr)
@@ -434,7 +513,10 @@ class relativedelta(object):
                                      other.second),
                              microsecond=(self.microsecond if self.microsecond
                                           is not None else
-                                          other.microsecond))
+                                          other.microsecond),
+                             day_overflow=self._merge_day_overflow(
+                                 self.day_overflow,
+                                 other.day_overflow))
 
     def __abs__(self):
         return self.__class__(years=abs(self.years),
@@ -452,7 +534,8 @@ class relativedelta(object):
                               hour=self.hour,
                               minute=self.minute,
                               second=self.second,
-                              microsecond=self.microsecond)
+                              microsecond=self.microsecond,
+                              day_overflow=self.day_overflow)
 
     def __neg__(self):
         return self.__class__(years=-self.years,
@@ -470,7 +553,8 @@ class relativedelta(object):
                              hour=self.hour,
                              minute=self.minute,
                              second=self.second,
-                             microsecond=self.microsecond)
+                             microsecond=self.microsecond,
+                             day_overflow=self.day_overflow)
 
     def __bool__(self):
         return not (not self.years and
@@ -513,7 +597,8 @@ class relativedelta(object):
                              hour=self.hour,
                              minute=self.minute,
                              second=self.second,
-                             microsecond=self.microsecond)
+                             microsecond=self.microsecond,
+                             day_overflow=self.day_overflow)
 
     __rmul__ = __mul__
 
@@ -542,7 +627,8 @@ class relativedelta(object):
                 self.hour == other.hour and
                 self.minute == other.minute and
                 self.second == other.second and
-                self.microsecond == other.microsecond)
+                self.microsecond == other.microsecond and
+                self.day_overflow == other.day_overflow)
 
     def __hash__(self):
         return hash((
@@ -562,6 +648,7 @@ class relativedelta(object):
             self.minute,
             self.second,
             self.microsecond,
+            self.day_overflow,
         ))
 
     def __ne__(self, other):
@@ -589,8 +676,17 @@ class relativedelta(object):
             value = getattr(self, attr)
             if value is not None:
                 l.append("{attr}={value}".format(attr=attr, value=repr(value)))
+        if self.day_overflow != DayOverflow.LAST_DAY:
+            l.append("day_overflow={value}".format(
+                value=repr(self.day_overflow)))
         return "{classname}({attrs})".format(classname=self.__class__.__name__,
                                              attrs=", ".join(l))
+
+
+def _validate_day_overflow(value):
+    if value not in _DAY_OVERFLOW_VALUES:
+        raise ValueError("Invalid day overflow strategy: %r" % (value,))
+    return _DAY_OVERFLOW_ALIASES.get(value, value)
 
 
 def _sign(x):

@@ -100,6 +100,27 @@ If the result falls on a day after the last one of the month, the last day of th
     >>> date(2003,5,31)+relativedelta(months=-1)
     datetime.date(2003, 4, 30)
 
+This behavior can be selected explicitly with ``DayOverflow.LAST_DAY``. The
+other available strategies are to raise an error or to let the extra days
+continue into the next month.
+
+.. doctest::
+
+    >>> date(2019,1,31)+relativedelta(months=+1, day_overflow=DayOverflow.LAST_DAY)
+    datetime.date(2019, 2, 28)
+    >>> date(2019,1,31)+relativedelta(months=+1, day_overflow=DayOverflow.OVERFLOW)
+    datetime.date(2019, 3, 3)
+    >>> date(2019,1,31)+relativedelta(months=+1, day_overflow=DayOverflow.RAISE)
+    Traceback (most recent call last):
+        ...
+    ValueError: day 31 is out of range for 2019-02
+
+Calendar resolution happens in this order: the target year and month are
+computed, the day is resolved using the selected strategy, relative days and
+time components are added, and ``weekday`` is applied last. Consequently,
+applying a one-month delta twice can differ from applying a two-month delta
+once when ``DayOverflow.OVERFLOW`` is used.
+
 .. doctest:: relativedelta
 
     >>> date(2000,2,28)+relativedelta(years=+1)
