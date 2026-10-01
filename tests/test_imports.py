@@ -49,7 +49,8 @@ def clean_import():
 @filter_import_warning
 @pytest.mark.parametrize(
     "module",
-    ["easter", "parser", "relativedelta", "rrule", "tz", "utils", "zoneinfo"],
+    ["easter", "parser", "relativedelta", "rrule", "tz", "utils",
+     "workcalendar", "zoneinfo"],
 )
 def test_lazy_import(clean_import, module):
     """Test that dateutil.[submodule] works for py version > 3.7"""

@@ -1,0 +1,6 @@
+Added ``dateutil.workcalendar.WorkCalendar``, a work-time calendar that
+declares a time zone, weekly work intervals and per-date overrides
+(holidays or temporary overtime), and measures accumulated working time
+or shifts a moment by a number of working seconds.  Overnight shifts,
+overlapping intervals and DST gaps/overlaps have documented semantics,
+and all results are measured in real elapsed seconds.

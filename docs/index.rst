@@ -28,6 +28,7 @@ Contents:
    tz
    tz.win <tzwin>
    utils
+   workcalendar
    zoneinfo
 
 Indices and tables
