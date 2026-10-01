@@ -9,7 +9,13 @@ Functions
 
 .. automethod:: dateutil.parser.parse
 
+.. automethod:: dateutil.parser.parse_candidates
+
 .. automethod:: dateutil.parser.isoparse
+
+.. autoclass:: dateutil.parser.ParseCandidate
+  :members:
+  :undoc-members:
 
 
 Classes
@@ -26,4 +32,3 @@ Warnings and Exceptions
 .. autoclass:: dateutil.parser.ParserError
 
 .. autoclass:: dateutil.parser.UnknownTimezoneWarning
-

@@ -31,12 +31,14 @@ Additional resources about date/time string formats can be found below:
 from __future__ import unicode_literals
 
 import datetime
+from itertools import permutations
 import re
 import string
 import time
 import warnings
 
 from calendar import monthrange
+from collections import namedtuple
 from io import StringIO
 
 import six
@@ -49,7 +51,12 @@ from warnings import warn
 from .. import relativedelta
 from .. import tz
 
-__all__ = ["parse", "parserinfo", "ParserError"]
+__all__ = ["parse", "parse_candidates", "parserinfo",
+           "ParseCandidate", "ParserError"]
+
+
+ParseCandidate = namedtuple("ParseCandidate",
+                            ["datetime", "year_month_day"])
 
 
 # TODO: pandas.core.tools.datetimes imports this explicitly.  Might be worth
@@ -398,6 +405,7 @@ class _ymd(list):
         self.dstridx = None
         self.mstridx = None
         self.ystridx = None
+        self.sources = []
 
     @property
     def has_year(self):
@@ -425,7 +433,7 @@ class _ymd(list):
             year = self[self.ystridx]
             return 1 <= value <= monthrange(year, month)[1]
 
-    def append(self, val, label=None):
+    def append(self, val, label=None, source=None):
         if hasattr(val, '__len__'):
             if val.isdigit() and len(val) > 2:
                 self.century_specified = True
@@ -439,6 +447,7 @@ class _ymd(list):
             label = 'Y'
 
         super(self.__class__, self).append(int(val))
+        self.sources.append(text_type(val) if source is None else source)
 
         if label == 'M':
             if self.has_month:
@@ -453,7 +462,14 @@ class _ymd(list):
                 raise ValueError('Year is already set')
             self.ystridx = len(self) - 1
 
-    def _resolve_from_stridxs(self, strids):
+    def _resolution_from_indices(self, strids, return_indices=False):
+        out = {key: self[strids[key]] for key in strids}
+        result = (out.get('y'), out.get('m'), out.get('d'))
+        if return_indices:
+            return result, strids
+        return result
+
+    def _resolve_from_stridxs(self, strids, return_indices=False):
         """
         Try to resolve the identities of year/month/day elements using
         ystridx, mstridx, and dstridx, if enough of these are specified.
@@ -468,12 +484,58 @@ class _ymd(list):
             strids[key] = val
 
         assert len(self) == len(strids)  # otherwise this should not be called
-        out = {key: self[strids[key]] for key in strids}
-        return (out.get('y'), out.get('m'), out.get('d'))
+        return self._resolution_from_indices(strids, return_indices)
 
-    def resolve_ymd(self, yearfirst, dayfirst):
+    def _resolution(self, indices, return_indices=False):
+        year = self[indices['y']] if 'y' in indices else None
+        month = self[indices['m']] if 'm' in indices else None
+        day = self[indices['d']] if 'd' in indices else None
+
+        if return_indices:
+            return (year, month, day), indices
+        return (year, month, day)
+
+    def candidate_indices(self, yearfirst, dayfirst):
+        indices = {}
+        if self.ystridx is not None:
+            indices['y'] = self.ystridx
+        if self.mstridx is not None:
+            indices['m'] = self.mstridx
+        if self.dstridx is not None:
+            indices['d'] = self.dstridx
+
+        available = [i for i in range(len(self)) if i not in indices.values()]
+        components = [key for key in ('y', 'm', 'd') if key not in indices]
+
+        candidates = set()
+        for assignment in permutations(components, len(available)):
+            candidate = indices.copy()
+            candidate.update({component: idx
+                              for idx, component in zip(available,
+                                                        assignment)})
+            candidates.add(tuple(sorted(candidate.items())))
+
+        preferred = self.resolve_ymd(yearfirst, dayfirst,
+                                     return_indices=True)[1]
+
+        def rank(candidate):
+            candidate = dict(candidate)
+            if candidate == preferred:
+                rank_value = 0
+            else:
+                rank_value = 1
+
+            return (rank_value,
+                    candidate.get('y', 9),
+                    candidate.get('m', 9),
+                    candidate.get('d', 9))
+
+        return [dict(candidate) for candidate in sorted(candidates, key=rank)]
+
+    def resolve_ymd(self, yearfirst, dayfirst, return_indices=False):
         len_ymd = len(self)
         year, month, day = (None, None, None)
+        indices = {}
 
         strids = (('y', self.ystridx),
                   ('m', self.mstridx),
@@ -482,7 +544,7 @@ class _ymd(list):
         strids = {key: val for key, val in strids if val is not None}
         if (len(self) == len(strids) > 0 or
                 (len(self) == 3 and len(strids) == 2)):
-            return self._resolve_from_stridxs(strids)
+            return self._resolve_from_stridxs(strids, return_indices)
 
         mstridx = self.mstridx
 
@@ -490,34 +552,44 @@ class _ymd(list):
             raise ValueError("More than three YMD values")
         elif len_ymd == 1 or (mstridx is not None and len_ymd == 2):
             # One member, or two members with a month string
+            other_idx = len(self) - 1 if mstridx == 0 else 0
             if mstridx is not None:
                 month = self[mstridx]
+                indices['m'] = mstridx
                 # since mstridx is 0 or 1, self[mstridx-1] always
                 # looks up the other element
-                other = self[mstridx - 1]
+                other = self[other_idx]
             else:
                 other = self[0]
 
             if len_ymd > 1 or mstridx is None:
                 if other > 31:
                     year = other
+                    indices = {'y': 0 if mstridx is None else other_idx}
                 else:
                     day = other
+                    indices = {'d': 0 if mstridx is None else other_idx}
+                if mstridx is not None:
+                    indices['m'] = mstridx
 
         elif len_ymd == 2:
             # Two members with numbers
             if self[0] > 31:
                 # 99-01
                 year, month = self
+                indices = {'y': 0, 'm': 1}
             elif self[1] > 31:
                 # 01-99
                 month, year = self
+                indices = {'m': 0, 'y': 1}
             elif dayfirst and self[1] <= 12:
                 # 13-01
                 day, month = self
+                indices = {'d': 0, 'm': 1}
             else:
                 # 01-13
                 month, day = self
+                indices = {'m': 0, 'd': 1}
 
         elif len_ymd == 3:
             # Three members
@@ -525,26 +597,32 @@ class _ymd(list):
                 if self[1] > 31:
                     # Apr-2003-25
                     month, year, day = self
+                    indices = {'m': 0, 'y': 1, 'd': 2}
                 else:
                     month, day, year = self
+                    indices = {'m': 0, 'd': 1, 'y': 2}
             elif mstridx == 1:
                 if self[0] > 31 or (yearfirst and self[2] <= 31):
                     # 99-Jan-01
                     year, month, day = self
+                    indices = {'y': 0, 'm': 1, 'd': 2}
                 else:
                     # 01-Jan-01
                     # Give precedence to day-first, since
                     # two-digit years is usually hand-written.
                     day, month, year = self
+                    indices = {'d': 0, 'm': 1, 'y': 2}
 
             elif mstridx == 2:
                 # WTF!?
                 if self[1] > 31:
                     # 01-99-Jan
                     day, year, month = self
+                    indices = {'d': 0, 'y': 1, 'm': 2}
                 else:
                     # 99-01-Jan
                     year, day, month = self
+                    indices = {'y': 0, 'd': 1, 'm': 2}
 
             else:
                 if (self[0] > 31 or
@@ -553,21 +631,88 @@ class _ymd(list):
                     # 99-01-01
                     if dayfirst and self[2] <= 12:
                         year, day, month = self
+                        indices = {'y': 0, 'd': 1, 'm': 2}
                     else:
                         year, month, day = self
+                        indices = {'y': 0, 'm': 1, 'd': 2}
                 elif self[0] > 12 or (dayfirst and self[1] <= 12):
                     # 13-01-01
                     day, month, year = self
+                    indices = {'d': 0, 'm': 1, 'y': 2}
                 else:
                     # 01-13-01
                     month, day, year = self
+                    indices = {'m': 0, 'd': 1, 'y': 2}
 
-        return year, month, day
+        return self._resolution(indices, return_indices)
 
 
 class parser(object):
     def __init__(self, info=None):
         self.info = info or parserinfo()
+
+    def parse_candidates(self, timestr, default=None,
+                         ignoretz=False, tzinfos=None, **kwargs):
+        """
+        Parse all distinguishable date interpretations of ``timestr``.
+
+        Numeric date fragments may be interpreted as any compatible year,
+        month or day.  Month names and fragments longer than two digits are
+        kept in their known roles.  Interpretations that produce invalid dates
+        are discarded, and interpretations producing the same datetime are
+        collapsed into one candidate.
+
+        The first candidate uses the same ordering preference as
+        :meth:`parse` for the current :class:`parserinfo`.
+
+        :return:
+            A list of :class:`ParseCandidate` objects.  Each object is also a
+            ``(datetime, year_month_day)`` tuple, where ``year_month_day``
+            contains only date fragments found in ``timestr``.
+        """
+        if default is None:
+            default = datetime.datetime.now().replace(hour=0, minute=0,
+                                                      second=0,
+                                                      microsecond=0)
+
+        candidate_data, skipped_tokens = self._parse(timestr,
+                                                     candidates=True,
+                                                     **kwargs)
+
+        if candidate_data is None:
+            raise ParserError("Unknown string format: %s", timestr)
+
+        if len(candidate_data) == 0:
+            raise ParserError("String does not contain a date: %s", timestr)
+
+        candidates = []
+        seen = set()
+        warn_unknown_tz = True
+
+        for res, year_month_day in candidate_data:
+            try:
+                ret = self._build_naive(res, default)
+            except ValueError:
+                continue
+
+            if not ignoretz:
+                ret = self._build_tzaware(ret, res, tzinfos,
+                                          warn_unknown=warn_unknown_tz)
+                warn_unknown_tz = False
+
+            if ret in seen:
+                continue
+
+            seen.add(ret)
+            candidates.append(ParseCandidate(ret, year_month_day))
+
+        if not candidates:
+            raise ParserError("Invalid date: %s", timestr)
+
+        if kwargs.get('fuzzy_with_tokens', False):
+            return candidates, skipped_tokens
+        else:
+            return candidates
 
     def parse(self, timestr, default=None,
               ignoretz=False, tzinfos=None, **kwargs):
@@ -664,7 +809,7 @@ class parser(object):
                      "tzname", "tzoffset", "ampm","any_unused_tokens"]
 
     def _parse(self, timestr, dayfirst=None, yearfirst=None, fuzzy=False,
-               fuzzy_with_tokens=False):
+               fuzzy_with_tokens=False, candidates=False):
         """
         Private method which performs the heavy lifting of parsing, called from
         ``parse()``, which passes on its ``kwargs`` to this function.
@@ -747,7 +892,7 @@ class parser(object):
                 # Check month name
                 elif info.month(l[i]) is not None:
                     value = info.month(l[i])
-                    ymd.append(value, 'M')
+                    ymd.append(value, 'M', source=l[i])
 
                     if i + 1 < len_l:
                         if l[i + 1] in ('-', '/'):
@@ -770,7 +915,7 @@ class parser(object):
                                 # Convert it here to become unambiguous
                                 value = int(l[i + 4])
                                 year = str(info.convertyear(value))
-                                ymd.append(year, 'Y')
+                                ymd.append(year, 'Y', source=l[i + 4])
                             else:
                                 # Wrong guess
                                 pass
@@ -856,21 +1001,64 @@ class parser(object):
             year, month, day = ymd.resolve_ymd(yearfirst, dayfirst)
 
             res.century_specified = ymd.century_specified
-            res.year = year
-            res.month = month
-            res.day = day
+
+            if candidates:
+                if len(ymd) == 0 and len(res) == 0:
+                    return [], None
+
+                candidate_data = []
+                for indices in ymd.candidate_indices(yearfirst, dayfirst):
+                    candidate_res = self._copy_result(res)
+                    candidate_res.century_specified = ymd.century_specified
+                    candidate_res.year = (ymd[indices['y']]
+                                          if 'y' in indices else None)
+                    candidate_res.month = (ymd[indices['m']]
+                                           if 'm' in indices else None)
+                    candidate_res.day = (ymd[indices['d']]
+                                         if 'd' in indices else None)
+
+                    if not info.validate(candidate_res):
+                        continue
+
+                    year_month_day = {}
+                    for key, attr in (('year', 'y'),
+                                      ('month', 'm'),
+                                      ('day', 'd')):
+                        if attr in indices:
+                            year_month_day[key] = ymd.sources[indices[attr]]
+
+                    candidate_data.append((candidate_res, year_month_day))
+
+                if not candidate_data:
+                    return [], None
+            else:
+                candidate_data = None
+                res.year = year
+                res.month = month
+                res.day = day
 
         except (IndexError, ValueError):
             return None, None
 
-        if not info.validate(res):
+        if not candidates and not info.validate(res):
             return None, None
 
         if fuzzy_with_tokens:
             skipped_tokens = self._recombine_skipped(l, skipped_idxs)
+            if candidates:
+                return candidate_data, tuple(skipped_tokens)
             return res, tuple(skipped_tokens)
         else:
+            if candidates:
+                return candidate_data, None
             return res, None
+
+    def _copy_result(self, result):
+        copied = self._result()
+        for attr in self._result.__slots__:
+            setattr(copied, attr, getattr(result, attr))
+        copied.century_specified = result.century_specified
+        return copied
 
     def _parse_numeric_token(self, tokens, idx, info, ymd, res, fuzzy):
         # Token is a number
@@ -961,7 +1149,7 @@ class parser(object):
                     value = info.month(tokens[idx + 2])
 
                     if value is not None:
-                        ymd.append(value, 'M')
+                        ymd.append(value, 'M', source=tokens[idx + 2])
                     else:
                         raise ValueError()
 
@@ -970,7 +1158,7 @@ class parser(object):
                     value = info.month(tokens[idx + 4])
 
                     if value is not None:
-                        ymd.append(value, 'M')
+                        ymd.append(value, 'M', source=tokens[idx + 4])
                     else:
                         ymd.append(tokens[idx + 4])
                     idx += 2
@@ -986,7 +1174,7 @@ class parser(object):
                 idx += 1
             else:
                 # Year, month or day
-                ymd.append(value)
+                ymd.append(value, source=value_repr)
             idx += 1
 
         elif info.ampm(tokens[idx + 1]) is not None and (0 <= value < 24):
@@ -996,7 +1184,7 @@ class parser(object):
             idx += 1
 
         elif ymd.could_be_day(value):
-            ymd.append(value)
+            ymd.append(value, source=value_repr)
 
         elif not fuzzy:
             raise ValueError()
@@ -1174,7 +1362,7 @@ class parser(object):
                             "or int offset.")
         return tzinfo
 
-    def _build_tzaware(self, naive, res, tzinfos):
+    def _build_tzaware(self, naive, res, tzinfos, warn_unknown=True):
         if (callable(tzinfos) or (tzinfos and res.tzname in tzinfos)):
             tzinfo = self._build_tzinfo(tzinfos, res.tzname, res.tzoffset)
             aware = naive.replace(tzinfo=tzinfo)
@@ -1204,12 +1392,13 @@ class parser(object):
         elif res.tzname:
             # tz-like string was parsed but we don't know what to do
             # with it
-            warnings.warn("tzname {tzname} identified but not understood.  "
-                          "Pass `tzinfos` argument in order to correctly "
-                          "return a timezone-aware datetime.  In a future "
-                          "version, this will raise an "
-                          "exception.".format(tzname=res.tzname),
-                          category=UnknownTimezoneWarning)
+            if warn_unknown:
+                warnings.warn("tzname {tzname} identified but not "
+                              "understood.  Pass `tzinfos` argument in "
+                              "order to correctly return a timezone-aware "
+                              "datetime.  In a future version, this will "
+                              "raise an exception.".format(tzname=res.tzname),
+                              category=UnknownTimezoneWarning)
             aware = naive
 
         return aware
@@ -1265,6 +1454,23 @@ class parser(object):
 
 
 DEFAULTPARSER = parser()
+
+
+def parse_candidates(timestr, parserinfo=None, **kwargs):
+    """
+    Parse all distinguishable interpretations of a date/time string.
+
+    Each result is a :class:`ParseCandidate`, whose ``year_month_day``
+    attribute contains the portions of ``timestr`` used as the year, month and
+    day.  Missing keys indicate that the corresponding value was supplied by
+    ``default`` rather than by the input string.  Month names and four-digit
+    years retain their known roles, invalid dates are discarded, and
+    equivalent datetimes are returned only once.
+    """
+    if parserinfo:
+        return parser(parserinfo).parse_candidates(timestr, **kwargs)
+    else:
+        return DEFAULTPARSER.parse_candidates(timestr, **kwargs)
 
 
 def parse(timestr, parserinfo=None, **kwargs):

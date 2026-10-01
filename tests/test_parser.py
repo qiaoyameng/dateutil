@@ -8,7 +8,8 @@ import sys
 
 from dateutil import tz
 from dateutil.tz import tzoffset
-from dateutil.parser import parse, parserinfo
+from dateutil.parser import (parse, parse_candidates, parserinfo,
+                             ParseCandidate)
 from dateutil.parser import ParserError
 from dateutil.parser import UnknownTimezoneWarning
 
@@ -183,6 +184,172 @@ def test_parse_yearfirst(sep):
     dstr = expected.strftime(fmt)
     result = parse(dstr, yearfirst=True)
     assert result == expected
+
+
+def test_parse_candidates_returns_all_numeric_interpretations():
+    default = datetime(2000, 1, 2)
+    candidates = parse_candidates("03/04/05", default=default)
+
+    assert candidates == [
+        ParseCandidate(datetime(2005, 3, 4),
+                       {"year": "05", "month": "03", "day": "04"}),
+        ParseCandidate(datetime(2003, 4, 5),
+                       {"year": "03", "month": "04", "day": "05"}),
+        ParseCandidate(datetime(2003, 5, 4),
+                       {"year": "03", "month": "05", "day": "04"}),
+        ParseCandidate(datetime(2004, 3, 5),
+                       {"year": "04", "month": "03", "day": "05"}),
+        ParseCandidate(datetime(2004, 5, 3),
+                       {"year": "04", "month": "05", "day": "03"}),
+        ParseCandidate(datetime(2005, 4, 3),
+                       {"year": "05", "month": "04", "day": "03"}),
+    ]
+    assert candidates[0].datetime == parse("03/04/05", default=default)
+
+
+@pytest.mark.parametrize("dayfirst,yearfirst,expected", [
+    (False, False, datetime(2005, 3, 4)),
+    (True, False, datetime(2005, 4, 3)),
+    (False, True, datetime(2003, 4, 5)),
+    (True, True, datetime(2003, 5, 4)),
+])
+def test_parse_candidates_orders_preferred_interpretation(dayfirst,
+                                                          yearfirst,
+                                                          expected):
+    info = parserinfo(dayfirst=dayfirst, yearfirst=yearfirst)
+    candidates = parse_candidates("03/04/05",
+                                  parserinfo=info,
+                                  default=datetime(2000, 1, 1))
+
+    assert len(candidates) == 6
+    assert candidates[0].datetime == expected
+
+
+def test_parse_candidates_explicit_month_is_not_ambiguous():
+    candidates = parse_candidates("03/Feb/05", default=datetime(2000, 1, 1))
+
+    assert candidates == [
+        ParseCandidate(datetime(2005, 2, 3),
+                       {"year": "05", "month": "Feb", "day": "03"}),
+        ParseCandidate(datetime(2003, 2, 5),
+                       {"year": "03", "month": "Feb", "day": "05"}),
+    ]
+
+
+def test_parse_candidates_four_digit_year_is_not_ambiguous():
+    candidates = parse_candidates("03/04/2005",
+                                  default=datetime(2000, 1, 1))
+
+    assert candidates == [
+        ParseCandidate(datetime(2005, 3, 4),
+                       {"year": "2005", "month": "03", "day": "04"}),
+        ParseCandidate(datetime(2005, 4, 3),
+                       {"year": "2005", "month": "04", "day": "03"}),
+    ]
+
+
+def test_parse_candidates_filters_invalid_dates():
+    candidates = parse_candidates("31/02/05", default=datetime(2000, 1, 1))
+
+    assert candidates == [
+        ParseCandidate(datetime(2031, 2, 5),
+                       {"year": "31", "month": "02", "day": "05"}),
+        ParseCandidate(datetime(2031, 5, 2),
+                       {"year": "31", "month": "05", "day": "02"}),
+        ParseCandidate(datetime(2002, 5, 31),
+                       {"year": "02", "month": "05", "day": "31"}),
+    ]
+
+
+def test_parse_candidates_deduplicates_equivalent_results():
+    candidates = parse_candidates("03/03/03", default=datetime(2000, 1, 1))
+
+    assert candidates == [
+        ParseCandidate(datetime(2003, 3, 3),
+                       {"year": "03", "month": "03", "day": "03"})
+    ]
+
+
+def test_parse_candidates_does_not_report_default_values_as_input():
+    candidates = parse_candidates("10:30", default=datetime(2000, 1, 2))
+
+    assert candidates == [
+        ParseCandidate(datetime(2000, 1, 2, 10, 30), {})
+    ]
+    assert "year" not in candidates[0].year_month_day
+    assert "month" not in candidates[0].year_month_day
+    assert "day" not in candidates[0].year_month_day
+
+
+def test_parse_candidates_partial_date_omits_default_year():
+    candidates = parse_candidates("03/04", default=datetime(2000, 1, 2))
+
+    assert candidates == [
+        ParseCandidate(datetime(2000, 3, 4),
+                       {"month": "03", "day": "04"}),
+        ParseCandidate(datetime(2003, 4, 2),
+                       {"year": "03", "month": "04"}),
+        ParseCandidate(datetime(2003, 1, 4),
+                       {"year": "03", "day": "04"}),
+        ParseCandidate(datetime(2004, 3, 2),
+                       {"year": "04", "month": "03"}),
+        ParseCandidate(datetime(2004, 1, 3),
+                       {"year": "04", "day": "03"}),
+        ParseCandidate(datetime(2000, 4, 3),
+                       {"day": "03", "month": "04"}),
+    ]
+    assert "year" not in candidates[0].year_month_day
+    assert "year" not in candidates[-1].year_month_day
+
+
+def test_parse_candidates_empty_string_uses_parser_error():
+    with pytest.raises(ParserError):
+        parse_candidates("", default=datetime(2000, 1, 1))
+
+
+def test_parse_candidates_fuzzy_with_tokens():
+    candidates, skipped = parse_candidates(
+        "Meet on 03/04/05 at 10:30",
+        default=datetime(2000, 1, 1),
+        fuzzy_with_tokens=True
+    )
+
+    assert len(candidates) == 6
+    assert candidates[0].datetime == datetime(2005, 3, 4, 10, 30)
+    assert skipped == ("Meet on ", " at ")
+
+
+def test_parse_candidates_two_digit_year_window():
+    info = parserinfo()
+    info._year = 2003
+    info._century = 2000
+
+    candidates = parse_candidates("65/01/02",
+                                  parserinfo=info,
+                                  default=datetime(2000, 1, 1))
+
+    assert [candidate.datetime.year for candidate in candidates] == [1965, 1965]
+    assert candidates[0].year_month_day["year"] == "65"
+
+
+def test_parse_candidates_with_timezone_text():
+    candidates = parse_candidates("03/04/05 10:30 UTC",
+                                  default=datetime(2000, 1, 1))
+
+    assert len(candidates) == 6
+    assert all(candidate.datetime.tzinfo == tz.UTC
+               for candidate in candidates)
+
+
+def test_parse_candidates_unknown_timezone_warns_once():
+    with pytest.warns(UnknownTimezoneWarning) as record:
+        candidates = parse_candidates("03/04/05 10:30 XYZ",
+                                      default=datetime(2000, 1, 1))
+
+    assert len(candidates) == 6
+    assert len(record) == 1
+    assert all(candidate.datetime.tzinfo is None
+               for candidate in candidates)
 
 
 @pytest.mark.parametrize('dstr,expected', [
