@@ -2570,6 +2570,170 @@ class RRuleTest(unittest.TestCase):
                                      datetime(1997, 9, 18, 9, 0),
                                      datetime(1997, 9, 19, 9, 0)])
 
+    def testXBefore(self):
+        rr = rrule(DAILY, dtstart=datetime(1997, 9, 2, 9, 0))
+        self.assertEqual(list(rr.xbefore(datetime(1997, 9, 8, 9, 0), 3)),
+                         [datetime(1997, 9, 7, 9, 0),
+                          datetime(1997, 9, 6, 9, 0),
+                          datetime(1997, 9, 5, 9, 0)])
+
+    def testXBeforeInc(self):
+        rr = rrule(DAILY, dtstart=datetime(1997, 9, 2, 9, 0))
+        self.assertEqual(list(rr.xbefore(datetime(1997, 9, 8, 9, 0), 3,
+                                         inc=True)),
+                         [datetime(1997, 9, 8, 9, 0),
+                          datetime(1997, 9, 7, 9, 0),
+                          datetime(1997, 9, 6, 9, 0)])
+
+    def testXBeforeZero(self):
+        rr = rrule(DAILY, dtstart=datetime(1997, 9, 2, 9, 0))
+        self.assertEqual(list(rr.xbefore(datetime(1997, 9, 8, 9, 0), 0)), [])
+
+    def testXBeforeMatchesForwardResults(self):
+        upper = datetime(1999, 10, 5, 12, 30, 17)
+        rules = [
+            rrule(YEARLY, until=upper, dtstart=datetime(1997, 1, 31)),
+            rrule(MONTHLY, until=upper,
+                  dtstart=datetime(1997, 1, 1),
+                  bymonthday=(1, 15, -1)),
+            rrule(MONTHLY, until=upper,
+                  dtstart=datetime(1997, 1, 1),
+                  byweekday=(MO, TU, WE, TH, FR),
+                  bysetpos=-1),
+            rrule(WEEKLY, until=upper, interval=2,
+                  dtstart=datetime(1997, 1, 3),
+                  byweekday=(MO, WE, FR)),
+            rrule(DAILY, until=upper, interval=3,
+                  dtstart=datetime(1997, 2, 28)),
+            rrule(HOURLY, until=upper, interval=2,
+                  dtstart=datetime(1999, 9, 20, 10, 15, 17),
+                  byhour=(10, 12, 14)),
+            rrule(MINUTELY, until=upper, interval=15,
+                   dtstart=datetime(1999, 9, 20, 9, 15),
+                   byhour=(9, 10),
+                   byminute=(0, 15, 30, 45)),
+            rrule(SECONDLY, until=upper, interval=17,
+                   dtstart=datetime(1999, 10, 1, 9, 0, 10)),
+        ]
+
+        for rule in rules:
+            expected = [dt for dt in rule if dt < upper][-10:]
+            expected.reverse()
+            self.assertEqual(list(rule.xbefore(upper, 10)), expected)
+
+    def testXBeforeCountLimit(self):
+        rr = rrule(DAILY, count=3,
+                   dtstart=datetime(1997, 9, 2, 9, 0))
+        self.assertEqual(list(rr.xbefore(datetime(2020, 1, 1), 10)),
+                         [datetime(1997, 9, 4, 9, 0),
+                          datetime(1997, 9, 3, 9, 0),
+                          datetime(1997, 9, 2, 9, 0)])
+
+    def testXBeforeUntilLimit(self):
+        rr = rrule(DAILY, until=datetime(1997, 9, 5, 9, 0),
+                   dtstart=datetime(1997, 9, 2, 9, 0))
+        self.assertEqual(list(rr.xbefore(datetime(2020, 1, 1), 10)),
+                         [datetime(1997, 9, 5, 9, 0),
+                          datetime(1997, 9, 4, 9, 0),
+                          datetime(1997, 9, 3, 9, 0),
+                          datetime(1997, 9, 2, 9, 0)])
+
+    def testXBeforeCountAndUntilLimit(self):
+        with pytest.warns(DeprecationWarning):
+            rr = rrule(DAILY,
+                       count=10,
+                       until=datetime(1997, 9, 4, 9, 0),
+                       dtstart=datetime(1997, 9, 2, 9, 0))
+
+        self.assertEqual(list(rr.xbefore(datetime(2020, 1, 1), 10)),
+                         [datetime(1997, 9, 4, 9, 0),
+                          datetime(1997, 9, 3, 9, 0),
+                          datetime(1997, 9, 2, 9, 0)])
+
+    def testXBeforeByDayByMonthDayBySetPos(self):
+        rr = rrule(MONTHLY,
+                   byweekday=FR,
+                   bysetpos=-1,
+                   dtstart=datetime(1997, 1, 1))
+        self.assertEqual(list(rr.xbefore(datetime(1997, 6, 1), 2)),
+                         [datetime(1997, 5, 30),
+                          datetime(1997, 4, 25)])
+
+        rr = rrule(YEARLY,
+                   bymonth=11,
+                   byweekday=TH,
+                   bysetpos=4,
+                   dtstart=datetime(1990, 1, 1))
+        self.assertEqual(list(rr.xbefore(datetime(2000, 1, 1), 2)),
+                         [datetime(1999, 11, 25),
+                          datetime(1998, 11, 26)])
+
+    def testXBeforeUnsupportedRules(self):
+        unsupported = [
+            rrule(YEARLY, byweekno=20, byweekday=MO,
+                  dtstart=datetime(1997, 1, 1)),
+            rrule(YEARLY, byyearday=100,
+                  dtstart=datetime(1997, 1, 1)),
+            rrule(YEARLY, byeaster=1,
+                  dtstart=datetime(1997, 1, 1)),
+            rrule(DAILY, bysetpos=1,
+                  dtstart=datetime(1997, 1, 1)),
+            rrule(HOURLY, bysetpos=1,
+                  dtstart=datetime(1997, 1, 1, 9)),
+        ]
+
+        for rule in unsupported:
+            with self.assertRaises(NotImplementedError):
+                list(rule.xbefore(datetime(2000, 1, 1), 10))
+
+    def testXBeforeRejectsUncachedRuleSet(self):
+        rule_set = rruleset()
+        rule_set.rrule(rrule(DAILY, dtstart=datetime(1997, 1, 1)))
+
+        with self.assertRaises(NotImplementedError):
+            list(rule_set.xbefore(datetime(2000, 1, 1), 10))
+
+    def testXBeforeSkipsHistoricalPeriods(self):
+        dtstart = datetime(1900, 1, 1)
+        upper = datetime(2020, 2, 1)
+        rr = rrule(YEARLY, dtstart=dtstart)
+
+        results = list(rr.xbefore(upper, 10))
+
+        self.assertEqual(results,
+                         [datetime(year, 1, 1)
+                          for year in range(2020, 2010, -1)])
+        self.assertEqual(rr._reverse_period_access_count(), 10)
+
+        forward_periods = upper.year - dtstart.year + 1
+        self.assertGreater(forward_periods,
+                           rr._reverse_period_access_count() * 10)
+
+    def testXBeforeCountsSparseMonthlyPeriods(self):
+        dtstart = datetime(1900, 1, 31)
+        upper = datetime(2020, 5, 1)
+        rr = rrule(MONTHLY, dtstart=dtstart)
+
+        results = list(rr.xbefore(upper, 10))
+
+        self.assertEqual(results,
+                         [datetime(2020, 3, 31),
+                          datetime(2020, 1, 31),
+                          datetime(2019, 12, 31),
+                          datetime(2019, 10, 31),
+                          datetime(2019, 8, 31),
+                          datetime(2019, 7, 31),
+                          datetime(2019, 5, 31),
+                          datetime(2019, 3, 31),
+                          datetime(2019, 1, 31),
+                          datetime(2018, 12, 31)])
+        self.assertEqual(rr._reverse_period_access_count(), 18)
+
+        forward_periods = (upper.year - dtstart.year) * 12 + \
+            upper.month - dtstart.month + 1
+        self.assertGreater(forward_periods,
+                           rr._reverse_period_access_count() * 70)
+
     def testBetween(self):
         self.assertEqual(rrule(DAILY,
                                #count=5,

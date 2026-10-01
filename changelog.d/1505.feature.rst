@@ -1,0 +1,3 @@
+Added ``rrule.xbefore()`` to generate occurrences backwards from a query
+bound, avoiding iteration from ``DTSTART`` for supported frequency and
+``BYDAY``/``BYMONTHDAY``/``BYSETPOS`` combinations.

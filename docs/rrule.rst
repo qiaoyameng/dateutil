@@ -567,6 +567,27 @@ rruleset examples
 -----------------
 Daily, for 7 days, jumping Saturday and Sunday occurrences.
 
+Reverse iteration
+-----------------
+Use ``xbefore()`` to generate a bounded number of recurrences in reverse
+order without iterating from ``DTSTART``.
+
+.. doctest:: rrule
+
+    >>> rr = rrule(MONTHLY,
+    ...            byweekday=MO(-1),
+    ...            dtstart=datetime(1980, 1, 1))
+    >>> list(rr.xbefore(datetime(2020, 3, 1), count=3))
+    [datetime.datetime(2020, 2, 24, 0, 0),
+     datetime.datetime(2020, 1, 27, 0, 0),
+     datetime.datetime(2019, 12, 30, 0, 0)]
+
+``UNTIL`` continues to restrict the original rule. ``COUNT`` also remains in
+force; because such a rule is finite, reverse iteration generates at most its
+declared prefix. Combinations using ``BYWEEKNO``, ``BYYEARDAY`` or
+``BYEASTER``, as well as ``BYSETPOS`` with daily or sub-daily frequencies,
+raise ``NotImplementedError`` instead of silently scanning the full history.
+
 .. testsetup:: rruleset
 
     import datetime

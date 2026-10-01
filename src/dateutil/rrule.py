@@ -268,6 +268,32 @@ class rrulebase(object):
 
                 yield d
 
+    def xbefore(self, dt, count=None, inc=False):
+        """
+        Generate recurrences in reverse order.
+
+        The default implementation only supports rulesets whose results have
+        already been generated completely.
+        """
+        if not self._cache_complete:
+            raise NotImplementedError(
+                "Reverse iteration is not supported for this recurrence set.")
+
+        if inc:
+            comp = lambda dc, dtc: dc <= dtc
+        else:
+            comp = lambda dc, dtc: dc < dtc
+
+        n = 0
+        for d in reversed(self._cache):
+            if comp(d, dt):
+                if count is not None:
+                    n += 1
+                    if n > count:
+                        break
+
+                yield d
+
     def between(self, after, before, inc=False, count=1):
         """ Returns all the occurrences of the rrule between after and before.
         The inc keyword defines what happens if after and/or before are
@@ -717,6 +743,8 @@ class rrule(rrulebase):
         if self._wkst:
             parts.append('WKST=' + repr(weekday(self._wkst))[0:2])
 
+        # COUNT makes the rule finite; generating its prefix is bounded by
+        # COUNT and never expands an infinite rule.
         if self._count is not None:
             parts.append('COUNT=' + str(self._count))
 
@@ -772,6 +800,289 @@ class rrule(rrulebase):
         new_kwargs.update(self._original_rule)
         new_kwargs.update(kwargs)
         return rrule(**new_kwargs)
+
+    def xbefore(self, dt, count=None, inc=False):
+        """
+        Generate up to ``count`` recurrences before ``dt`` in reverse order.
+
+        Unlike :meth:`before`, this starts at the query bound and walks
+        backwards through recurrence periods. Rules using ``BYWEEKNO``,
+        ``BYYEARDAY`` or ``BYEASTER``, as well as daily or sub-daily rules
+        using ``BYSETPOS``, are rejected rather than being expanded from
+        ``DTSTART``.
+        """
+        self._check_reverse_supported()
+        self._reverse_period_accesses = 0
+
+        if count is not None and count < 0:
+            raise ValueError("count must be a non-negative integer")
+
+        upper = dt
+        bound = dt
+        if self._until is not None and self._until < bound:
+            bound = self._until
+
+        if inc:
+            keep = lambda value: value <= dt
+        else:
+            keep = lambda value: value < dt
+
+        if self._count is not None:
+            occurrences = list(
+                itertools.islice(self._iter(), self._count))
+            for value in reversed(occurrences):
+                if value < self._dtstart:
+                    break
+                if keep(value):
+                    if count is not None:
+                        count -= 1
+                        if count < 0:
+                            break
+                    yield value
+            return
+
+        if bound < self._dtstart:
+            return
+
+        if self._freq < HOURLY:
+            batches = self._reverse_date_batches(bound)
+        else:
+            batches = self._reverse_time_batches(bound)
+
+        emitted = 0
+        batch_iterator = iter(batches)
+        while count is None or emitted < count:
+            try:
+                batch = next(batch_iterator)
+            except StopIteration:
+                return
+
+            for value in reversed(batch):
+                if value >= self._dtstart and keep(value):
+                    if count is not None and emitted >= count:
+                        return
+                    yield value
+                    emitted += 1
+
+
+    def _record_reverse_period_access(self):
+        self._reverse_period_accesses = (
+            getattr(self, "_reverse_period_accesses", 0) + 1)
+
+    def _reverse_period_access_count(self):
+        return getattr(self, "_reverse_period_accesses", None)
+
+    def _check_reverse_supported(self):
+        if self._byweekno is not None or self._byyearday is not None or \
+                self._byeaster is not None:
+            raise NotImplementedError(
+                "Reverse iteration does not support BYWEEKNO, BYYEARDAY or "
+                "BYEASTER rules.")
+
+        if self._freq >= DAILY and self._bysetpos:
+            raise NotImplementedError(
+                "Reverse iteration only supports BYSETPOS with weekly, "
+                "monthly or yearly frequencies.")
+
+        if self._freq == WEEKLY and self._bynweekday is not None:
+            raise NotImplementedError(
+                "Reverse iteration does not support nth BYDAY with weekly "
+                "rules.")
+
+    def _reverse_day_matches(self, ii, day_index):
+        return not ((self._bymonth and ii.mmask[day_index] not in
+                     self._bymonth) or
+                    (self._byweekday and ii.wdaymask[day_index] not in
+                     self._byweekday) or
+                    (ii.nwdaymask and not ii.nwdaymask[day_index]) or
+                    ((self._bymonthday or self._bynmonthday) and
+                     ii.mdaymask[day_index] not in self._bymonthday and
+                     ii.nmdaymask[day_index] not in self._bynmonthday))
+
+    def _reverse_date_batches(self, upper):
+        start_date = self._dtstart.date()
+        upper_date = upper.date()
+        ii = _iterinfo(self)
+
+        if self._freq == YEARLY:
+            index = (upper_date.year - start_date.year) // self._interval
+            while index >= 0:
+                year = start_date.year + index * self._interval
+                if year < datetime.MINYEAR:
+                    return
+                ii.rebuild(year, 1)
+                dayset, start, end = ii.ydayset(year, 1, 1)
+                self._record_reverse_period_access()
+                yield self._reverse_date_batch(ii, dayset, start, end,
+                                               upper)
+                index -= 1
+        elif self._freq == MONTHLY:
+            start_index = start_date.year * 12 + start_date.month - 1
+            upper_index = upper_date.year * 12 + upper_date.month - 1
+            index = (upper_index - start_index) // self._interval
+            while index >= 0:
+                total = start_index + index * self._interval
+                year, month = divmod(total, 12)
+                month += 1
+                if year < datetime.MINYEAR:
+                    return
+                ii.rebuild(year, month)
+                dayset, start, end = ii.mdayset(year, month, 1)
+                self._record_reverse_period_access()
+                yield self._reverse_date_batch(ii, dayset, start, end,
+                                               upper)
+                index -= 1
+        elif self._freq == WEEKLY:
+            step = self._interval * 7
+            week_start = (start_date.toordinal() -
+                          (start_date.weekday() - self._wkst) % 7)
+            index = (upper_date.toordinal() - week_start) // step
+            while index >= 0:
+                period_start = week_start + index * step
+                period_date = datetime.date.fromordinal(period_start)
+                ii.rebuild(period_date.year, period_date.month)
+                dayset, start, end = ii.wdayset(period_date.year,
+                                                period_date.month,
+                                                period_date.day)
+                self._record_reverse_period_access()
+                yield self._reverse_date_batch(ii, dayset, start, end,
+                                               upper)
+                index -= 1
+        else:
+            step = self._interval
+            index = (upper_date.toordinal() - start_date.toordinal()) // step
+            while index >= 0:
+                period_date = datetime.date.fromordinal(
+                    start_date.toordinal() + index * step)
+                ii.rebuild(period_date.year, period_date.month)
+                dayset, start, end = ii.ddayset(period_date.year,
+                                                period_date.month,
+                                                period_date.day)
+                self._record_reverse_period_access()
+                yield self._reverse_date_batch(ii, dayset, start, end,
+                                               upper)
+                index -= 1
+
+    def _reverse_date_batch(self, ii, dayset, start, end, upper):
+        for day_index in range(start, end):
+            if not self._reverse_day_matches(ii, day_index):
+                dayset[day_index] = None
+
+        results = []
+        timeset = self._timeset
+        valid_days = [dayset[i] for i in range(start, end)
+                      if dayset[i] is not None]
+
+        if self._bysetpos:
+            for position in self._bysetpos:
+                if position < 0:
+                    day_position, time_position = divmod(
+                        position, len(timeset))
+                else:
+                    day_position, time_position = divmod(
+                        position - 1, len(timeset))
+                try:
+                    day_index = valid_days[day_position]
+                    time_value = timeset[time_position]
+                except IndexError:
+                    continue
+
+                day_value = datetime.date.fromordinal(
+                    ii.yearordinal + day_index)
+                result = datetime.datetime.combine(day_value, time_value)
+                if result >= self._dtstart and result <= upper and \
+                        result not in results:
+                    results.append(result)
+            results.sort()
+        else:
+            for day_index in valid_days:
+                day_value = datetime.date.fromordinal(
+                    ii.yearordinal + day_index)
+                for time_value in timeset:
+                    result = datetime.datetime.combine(day_value, time_value)
+                    if self._dtstart <= result <= upper:
+                        results.append(result)
+
+        return results
+
+    def _reverse_time_batches(self, upper):
+        if self._freq == HOURLY:
+            unit_seconds = 3600
+        elif self._freq == MINUTELY:
+            unit_seconds = 60
+        else:
+            unit_seconds = 1
+
+        step = self._interval * unit_seconds
+        day_seconds = 86400
+        start_naive = self._dtstart.replace(tzinfo=None)
+        upper_naive = upper.replace(tzinfo=None)
+        start_day = start_naive.date()
+        upper_day = upper_naive.date()
+        day_offset = (upper_day - start_day).days
+
+        ii = _iterinfo(self)
+        while day_offset >= 0:
+            current_day = start_day + datetime.timedelta(days=day_offset)
+            day_start = datetime.datetime.combine(
+                current_day, datetime.time())
+            day_limit_offset = day_seconds - 1
+            if current_day == upper_day:
+                day_limit_offset = int(
+                    (upper_naive - day_start).total_seconds())
+
+            first_total = (day_start - start_naive).total_seconds()
+            last_total = first_total + day_limit_offset
+            index = int(last_total // step)
+            lower_index = int(-((-first_total) // step))
+
+            ii.rebuild(current_day.year, current_day.month)
+            date_index = current_day.toordinal() - ii.yearordinal
+            day_matches = self._reverse_day_matches(ii, date_index)
+
+            if day_matches:
+                while index >= lower_index:
+                    base = start_naive + datetime.timedelta(
+                        seconds=index * step)
+                    self._record_reverse_period_access()
+                    batch = []
+                    if self._freq == HOURLY:
+                        if not self._byhour or base.hour in self._byhour:
+                            for minute in self._byminute:
+                                for second in self._bysecond:
+                                    value = base.replace(minute=minute,
+                                                         second=second,
+                                                         microsecond=0)
+                                    batch.append(value)
+                    elif self._freq == MINUTELY:
+                        if ((not self._byhour or
+                             base.hour in self._byhour) and
+                                (not self._byminute or
+                                 base.minute in self._byminute)):
+                            for second in self._bysecond:
+                                batch.append(base.replace(second=second,
+                                                          microsecond=0))
+                    else:
+                        if ((not self._byhour or
+                             base.hour in self._byhour) and
+                                (not self._byminute or
+                                 base.minute in self._byminute) and
+                                (not self._bysecond or
+                                 base.second in self._bysecond)):
+                            batch.append(base.replace(microsecond=0))
+
+                    batch = [
+                        value.replace(tzinfo=self._tzinfo)
+                        for value in batch
+                        if self._dtstart.replace(tzinfo=None) <= value <=
+                        upper_naive
+                    ]
+                    if batch:
+                        yield batch
+
+                    index -= 1
+
+            day_offset -= 1
 
     def _iter(self):
         year, month, day, hour, minute, second, weekday, yearday, _ = \
