@@ -11,6 +11,7 @@ import heapq
 import itertools
 import re
 import sys
+from collections import deque
 from functools import wraps
 # For warning about deprecation of until and count
 from warnings import warn
@@ -268,6 +269,61 @@ class rrulebase(object):
 
                 yield d
 
+    def xbefore(self, dt, count=None, inc=False):
+        """
+        Generator which yields up to `count` recurrences at or before the
+        given datetime instance, in *reverse* chronological order (newest
+        first), equivalent to repeatedly calling `before`.
+
+        :param dt:
+            The datetime at which to start generating recurrences, going
+            backwards.
+
+        :param count:
+            The maximum number of recurrences to generate. If `None`
+            (default), dates are generated until the recurrence rule is
+            exhausted.
+
+        :param inc:
+            If `dt` is an instance of the rule and `inc` is `True`, it is
+            included in the output.
+
+        :yields: Yields a sequence of `datetime` objects, newest first.
+
+        .. note::
+            This base implementation scans forward from the start of the
+            recurrence and buffers the matches, so its cost is proportional
+            to the number of recurrences since ``dtstart``. :class:`rrule`
+            overrides this with a reverse, period-skipping implementation
+            for the rule shapes it supports.
+        """
+        if self._cache_complete:
+            gen = self._cache
+        else:
+            gen = self
+
+        if count is not None and count <= 0:
+            return
+
+        if count is None:
+            buf = []
+        else:
+            buf = deque(maxlen=count)
+
+        # Select the comparison function
+        if inc:
+            comp = lambda dc, dtc: dc > dtc
+        else:
+            comp = lambda dc, dtc: dc >= dtc
+
+        for d in gen:
+            if comp(d, dt):
+                break
+            buf.append(d)
+
+        for d in reversed(buf):
+            yield d
+
     def between(self, after, before, inc=False, count=1):
         """ Returns all the occurrences of the rrule between after and before.
         The inc keyword defines what happens if after and/or before are
@@ -447,6 +503,9 @@ class rrule(rrulebase):
         self._freq = freq
         self._interval = interval
         self._count = count
+        # Diagnostic: number of frequency periods examined by the most
+        # recent xbefore() call (see rrule._riter).
+        self._last_reverse_periods = None
 
         # Cache the original byxxx rules, if they are provided, as the _byxxx
         # attributes do not necessarily map to the inputs, and this can be
@@ -1028,6 +1087,343 @@ class rrule(rrulebase):
                                 return
                         daysinmonth = calendar.monthrange(year, month)[1]
                     ii.rebuild(year, month)
+
+    def xbefore(self, dt, count=None, inc=False):
+        """
+        Generator which yields up to `count` recurrences at or before the
+        given datetime instance, in *reverse* chronological order (newest
+        first), without walking the rule forward from ``dtstart``.
+
+        Instead of replaying every period since ``dtstart``, the period
+        (year, month, week or day, depending on ``freq``) containing the
+        query bound is located arithmetically, and periods are then
+        generated backwards one at a time. The cost is therefore
+        proportional to the number of periods that actually contain
+        results, not to the age of the rule.
+
+        :param dt:
+            The datetime at which to start generating recurrences, going
+            backwards.
+
+        :param count:
+            The maximum number of recurrences to generate. If `None`
+            (default), dates are generated until the recurrence rule is
+            exhausted.
+
+        :param inc:
+            If `dt` is an instance of the rule and `inc` is `True`, it is
+            included in the output.
+
+        :yields: Yields a sequence of `datetime` objects, newest first.
+
+        Supported rules: ``freq`` of ``YEARLY``, ``MONTHLY``, ``WEEKLY`` or
+        ``DAILY``, optionally combined with ``interval``, ``wkst``,
+        ``bymonth``, ``bymonthday``, ``byweekday`` (including the nth
+        weekday form, e.g. ``FR(-1)``), ``bysetpos``, ``byhour``,
+        ``byminute``, ``bysecond``, ``until`` and ``count``. Both ``until``
+        and ``count`` still limit the recurrence set exactly as they do for
+        forward iteration.
+
+        .. note::
+            For rules using ``count``, the position of the final occurrence
+            cannot be known without counting from ``dtstart``, so a single
+            bounded forward pass over the *periods* (never past the query
+            bound, ``until`` or the end of the calendar) is performed to
+            locate it. No unbounded precomputation is done, and no results
+            are materialized beyond the requested window.
+
+        :raises NotImplementedError:
+            If the rule uses ``HOURLY``, ``MINUTELY`` or ``SECONDLY``
+            frequencies, or the ``byweekno``, ``byyearday`` or ``byeaster``
+            parameters, which this fast path does not support. Use
+            :meth:`rrulebase.before`, :meth:`rrulebase.between` or forward
+            iteration for such rules.
+
+        After each call, the number of frequency periods examined is
+        available as the ``_last_reverse_periods`` attribute, which may be
+        used to verify that historical periods are being skipped.
+        """
+        self._check_reverse_supported()
+        return self._riter(dt, count, inc)
+
+    def _check_reverse_supported(self):
+        """
+        Raise a descriptive NotImplementedError if this rule uses features
+        the reverse period-skipping iterator does not support.
+        """
+        if self._freq > DAILY:
+            raise NotImplementedError(
+                "xbefore() does not support %s frequencies; use before(), "
+                "between() or forward iteration instead"
+                % (FREQNAMES[self._freq],))
+
+        unsupported = []
+        if self._byweekno is not None:
+            unsupported.append("byweekno")
+        if self._byyearday is not None:
+            unsupported.append("byyearday")
+        if self._byeaster is not None:
+            unsupported.append("byeaster")
+        if unsupported:
+            raise NotImplementedError(
+                "xbefore() does not support rules with %s; use before(), "
+                "between() or forward iteration instead"
+                % (", ".join(unsupported),))
+
+    def _riter(self, dt, count, inc):
+        """
+        Reverse-iteration generator backing rrule.xbefore. Yields the
+        occurrences of this rule at or before ``dt`` (see ``inc``), newest
+        first, honoring the rule's own ``until`` and ``count`` limits.
+        """
+        dtstart = self._dtstart
+        until = self._until
+        self._last_reverse_periods = 0
+
+        if count is not None and count <= 0:
+            return
+
+        if self._count is not None and self._count <= 0:
+            return
+
+        # The latest datetime that can contain a valid occurrence.
+        if until is not None and until < dt:
+            loc = until
+        else:
+            loc = dt
+
+        if loc < dtstart:
+            return
+
+        # A rule with ``count`` only contains its first ``count``
+        # occurrences, so occurrences past the count-th one must be
+        # excluded. That cutoff is inherently defined from the start of
+        # the rule, so locate it with a bounded forward pass over periods
+        # (stopping at ``loc`` at the latest), then iterate backwards from
+        # there. Rules without ``count`` skip history entirely.
+        if self._count is not None:
+            count_end = self._reverse_count_end(loc)
+            if count_end is not None:
+                loc = count_end
+        else:
+            count_end = None
+
+        ii = _iterinfo(self)
+        emitted = 0
+        for year, month, day in self._iter_periods_backward(loc):
+            self._last_reverse_periods += 1
+            occurrences = self._period_occurrences(ii, year, month, day)
+            for res in reversed(occurrences):
+                if res < dtstart:
+                    continue
+                if until is not None and res > until:
+                    continue
+                if count_end is not None and res > count_end:
+                    continue
+                if inc:
+                    if res > dt:
+                        continue
+                elif res >= dt:
+                    continue
+                yield res
+                emitted += 1
+                if count is not None and emitted >= count:
+                    return
+
+    def _reverse_count_end(self, limit):
+        """
+        For a rule with ``count``: return the datetime of the ``count``-th
+        occurrence (the last one the rule may produce), or None if the
+        rule produces fewer than ``count`` occurrences at or before
+        ``limit`` (in which case ``count`` places no additional
+        restriction within the queried window).
+
+        This walks periods forward from ``dtstart`` counting occurrences,
+        but never looks past ``limit`` (which already incorporates
+        ``until``), so the work is bounded by the query window rather than
+        being an unbounded precomputation.
+        """
+        dtstart = self._dtstart
+        target = self._count
+        total = 0
+        ii = _iterinfo(self)
+        for year, month, day in self._iter_periods_forward():
+            self._last_reverse_periods += 1
+            period_start = datetime.datetime.combine(
+                datetime.date(year, month, day), datetime.time.min)
+            if period_start > limit:
+                # No occurrence in this or any later period can be
+                # <= limit, so ``count`` does not restrict the window.
+                return None
+            for res in self._period_occurrences(ii, year, month, day):
+                if res < dtstart or res > limit:
+                    continue
+                total += 1
+                if total == target:
+                    return res
+        return None
+
+    def _period_occurrences(self, ii, year, month, day):
+        """
+        Compute the ascending list of occurrences of a single frequency
+        period (the year, month, week or day identified by the arguments),
+        applying the same day filtering, bysetpos and timeset logic as
+        rrule._iter. ``ii`` is a caller-provided _iterinfo, reused (and
+        rebuilt as needed) across periods.
+        """
+        freq = self._freq
+        ii.rebuild(year, month)
+        if freq == YEARLY:
+            dayset, start, end = ii.ydayset(year, month, day)
+        elif freq == MONTHLY:
+            dayset, start, end = ii.mdayset(year, month, day)
+        elif freq == WEEKLY:
+            dayset, start, end = ii.wdayset(year, month, day)
+        else:
+            dayset, start, end = ii.ddayset(year, month, day)
+
+        # Filter the days of the period, mirroring rrule._iter. The
+        # byweekno/byyearday/byeaster branches of _iter are unreachable
+        # here because _check_reverse_supported rejects them.
+        bymonth = self._bymonth
+        byweekday = self._byweekday
+        bymonthday = self._bymonthday
+        bynmonthday = self._bynmonthday
+        for i in dayset[start:end]:
+            if ((bymonth and ii.mmask[i] not in bymonth) or
+                (byweekday and ii.wdaymask[i] not in byweekday) or
+                (ii.nwdaymask and not ii.nwdaymask[i]) or
+                ((bymonthday or bynmonthday) and
+                 ii.mdaymask[i] not in bymonthday and
+                 ii.nmdaymask[i] not in bynmonthday)):
+                dayset[i] = None
+
+        timeset = self._timeset
+        bysetpos = self._bysetpos
+        if bysetpos and timeset:
+            poslist = []
+            for pos in bysetpos:
+                if pos < 0:
+                    daypos, timepos = divmod(pos, len(timeset))
+                else:
+                    daypos, timepos = divmod(pos-1, len(timeset))
+                try:
+                    i = [x for x in dayset[start:end]
+                         if x is not None][daypos]
+                    time = timeset[timepos]
+                except IndexError:
+                    pass
+                else:
+                    date = datetime.date.fromordinal(ii.yearordinal+i)
+                    res = datetime.datetime.combine(date, time)
+                    if res not in poslist:
+                        poslist.append(res)
+            poslist.sort()
+            return poslist
+
+        results = []
+        for i in dayset[start:end]:
+            if i is not None:
+                date = datetime.date.fromordinal(ii.yearordinal + i)
+                for time in timeset:
+                    results.append(datetime.datetime.combine(date, time))
+        return results
+
+    def _week_period_base(self):
+        """
+        Ordinal of the wkst-aligned start of the week containing dtstart.
+        """
+        ds = self._dtstart
+        return ds.toordinal() - (ds.weekday() - self._wkst) % 7
+
+    def _iter_periods_forward(self):
+        """
+        Yield (year, month, day) identifying each frequency period of this
+        rule, ascending from dtstart's period, in the same order and with
+        the same alignment as rrule._iter visits them.
+        """
+        freq = self._freq
+        interval = self._interval
+        ds = self._dtstart
+        max_ordinal = datetime.date.max.toordinal()
+        if freq == YEARLY:
+            year = ds.year
+            while year <= datetime.MAXYEAR:
+                yield year, 1, 1
+                year += interval
+        elif freq == MONTHLY:
+            mval = ds.year * 12 + ds.month
+            while True:
+                div, mod = divmod(mval, 12)
+                if mod == 0:
+                    mod = 12
+                    div -= 1
+                if div > datetime.MAXYEAR:
+                    break
+                yield div, mod, 1
+                mval += interval
+        elif freq == WEEKLY:
+            # The first period is the partial week starting at dtstart;
+            # later periods are wkst-aligned weeks spaced interval apart.
+            yield ds.year, ds.month, ds.day
+            ordinal = self._week_period_base() + interval * 7
+            while ordinal <= max_ordinal:
+                d = datetime.date.fromordinal(ordinal)
+                yield d.year, d.month, d.day
+                ordinal += interval * 7
+        else:  # DAILY
+            ordinal = ds.toordinal()
+            while ordinal <= max_ordinal:
+                d = datetime.date.fromordinal(ordinal)
+                yield d.year, d.month, d.day
+                ordinal += interval
+
+    def _iter_periods_backward(self, loc):
+        """
+        Yield (year, month, day) identifying each frequency period of this
+        rule, descending from the period containing ``loc`` down to (and
+        including) dtstart's period. ``loc`` must be >= dtstart.
+        """
+        freq = self._freq
+        interval = self._interval
+        ds = self._dtstart
+        if freq == YEARLY:
+            year = ds.year + ((loc.year - ds.year) // interval) * interval
+            while year >= ds.year:
+                yield year, 1, 1
+                year -= interval
+        elif freq == MONTHLY:
+            m0 = ds.year * 12 + ds.month
+            mval = m0 + ((loc.year * 12 + loc.month - m0)
+                         // interval) * interval
+            while mval >= m0:
+                div, mod = divmod(mval, 12)
+                if mod == 0:
+                    mod = 12
+                    div -= 1
+                yield div, mod, 1
+                mval -= interval
+        elif freq == WEEKLY:
+            base = self._week_period_base()
+            first_aligned = base + interval * 7
+            loc_ordinal = loc.toordinal()
+            if loc_ordinal >= first_aligned:
+                span = interval * 7
+                ordinal = first_aligned + \
+                    ((loc_ordinal - first_aligned) // span) * span
+                while ordinal >= first_aligned:
+                    d = datetime.date.fromordinal(ordinal)
+                    yield d.year, d.month, d.day
+                    ordinal -= span
+            # The first period is the partial week starting at dtstart.
+            yield ds.year, ds.month, ds.day
+        else:  # DAILY
+            d0 = ds.toordinal()
+            ordinal = d0 + ((loc.toordinal() - d0) // interval) * interval
+            while ordinal >= d0:
+                d = datetime.date.fromordinal(ordinal)
+                yield d.year, d.month, d.day
+                ordinal -= interval
 
     def __construct_byset(self, start, byxxx, base):
         """

@@ -1,0 +1,10 @@
+Added ``rrule.xbefore()``, a reverse iteration entry point which yields
+recurrences at or before a given datetime, newest first. For ``YEARLY``,
+``MONTHLY``, ``WEEKLY`` and ``DAILY`` rules (including ``byweekday``,
+``bymonthday`` and ``bysetpos`` combinations) it locates the period
+containing the query bound arithmetically and walks periods backwards, so
+fetching the most recent occurrences of a decades-old rule no longer
+requires iterating every period since ``dtstart``. ``until`` and ``count``
+still limit the recurrence set; rules using sub-daily frequencies or
+``byweekno``/``byyearday``/``byeaster`` raise ``NotImplementedError``
+directing callers to the forward-iteration APIs.
