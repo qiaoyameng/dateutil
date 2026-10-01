@@ -1,0 +1,6 @@
+Added ``dateutil.workcalendar.WorkCalendar``, a work-time calendar
+declaring a time zone, weekly work intervals and per-date replacement
+intervals (holidays or exceptional hours). It provides
+``work_seconds_between`` and ``add_work_seconds``, measured in real
+elapsed seconds, with documented conventions for overnight shifts,
+overlapping intervals and DST repeated/missing hours.

@@ -20,6 +20,7 @@ def test_imported_modules():
     import dateutil.rrule
     import dateutil.tz
     import dateutil.utils
+    import dateutil.workcalendar
     import dateutil.zoneinfo
 
     assert dateutil.easter == new_locals.pop("easter")
@@ -28,6 +29,7 @@ def test_imported_modules():
     assert dateutil.rrule == new_locals.pop("rrule")
     assert dateutil.tz == new_locals.pop("tz")
     assert dateutil.utils == new_locals.pop("utils")
+    assert dateutil.workcalendar == new_locals.pop("workcalendar")
     assert dateutil.zoneinfo == new_locals.pop("zoneinfo")
 
     assert not new_locals

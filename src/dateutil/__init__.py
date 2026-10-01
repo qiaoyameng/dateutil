@@ -7,7 +7,7 @@ except ImportError:
     __version__ = 'unknown'
 
 __all__ = ['easter', 'parser', 'relativedelta', 'rrule', 'tz',
-           'utils', 'zoneinfo']
+           'utils', 'workcalendar', 'zoneinfo']
 
 def __getattr__(name):
     import importlib
