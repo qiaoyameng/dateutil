@@ -1,0 +1,7 @@
+Added an ISO-8601 time interval parser, :func:`dateutil.parser.parse_interval`,
+supporting start/end, start/duration and duration/end forms, explicit open
+end points (``..``), exclusive boundary indicators (``<``/``>``) and input
+precision reporting via the new :class:`dateutil.parser.Interval` result.
+Durations are returned as :class:`dateutil.relativedelta.relativedelta` and
+can be parsed on their own with :func:`dateutil.parser.parse_isoduration`
+(reporting issue by @gforcada).

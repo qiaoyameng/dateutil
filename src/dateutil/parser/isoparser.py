@@ -131,6 +131,12 @@ class isoparser(object):
 
         .. versionadded:: 2.7.0
         """
+        if b'/' in dt_str:
+            # The "/" separator marks an ISO-8601 time interval; those are
+            # parsed by dateutil.parser.isointerval, not by isoparse.
+            raise ValueError('isoparse does not support ISO-8601 time '
+                             'intervals (use dateutil.parser.parse_interval)')
+
         components, pos = self._parse_isodate(dt_str)
 
         if len(dt_str) > pos:
