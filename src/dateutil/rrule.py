@@ -20,6 +20,7 @@ from warnings import warn
 from ._common import weekday as weekdaybase
 
 __all__ = ["rrule", "rruleset", "rrulestr",
+           "rruleset_to_ical", "rruleset_from_ical",
            "YEARLY", "MONTHLY", "WEEKLY", "DAILY",
            "HOURLY", "MINUTELY", "SECONDLY",
            "MO", "TU", "WE", "TH", "FR", "SA", "SU"]
@@ -725,6 +726,14 @@ class rrule(rrulebase):
             output.append(self._dtstart.strftime('DTSTART:%Y%m%dT%H%M%S'))
             h, m, s = self._dtstart.timetuple()[3:6]
 
+        output.append('RRULE:' + self._rrule_value())
+        return '\n'.join(output)
+
+    def _rrule_value(self):
+        """
+        The value of this rule as an iCalendar ``RRULE`` property
+        (e.g. ``FREQ=DAILY;COUNT=5``), without the property name.
+        """
         parts = ['FREQ=' + FREQNAMES[self._freq]]
         if self._interval != 1:
             parts.append('INTERVAL=' + str(self._interval))
@@ -771,8 +780,7 @@ class rrule(rrulebase):
                 parts.append(partfmt.format(name=name, vals=(','.join(str(v)
                                                              for v in value))))
 
-        output.append('RRULE:' + ';'.join(parts))
-        return '\n'.join(output)
+        return ';'.join(parts)
 
     def replace(self, **kwargs):
         """Return new rrule with same attributes except for those attributes given new
@@ -1748,5 +1756,391 @@ class _rrulestr:
 
 
 rrulestr = _rrulestr()
+
+# Restricted iCalendar (RFC 5545) serialization of recurrence sets.
+#
+# Unlike rrulestr, this is a strict, lossless interface intended for
+# persisting an rruleset: only the DTSTART, RRULE, RDATE, EXRULE and
+# EXDATE properties are supported, named time zones are resolved
+# exclusively through a caller-supplied registry, and anything that
+# cannot be represented exactly is rejected with a ValueError.
+
+_ICAL_DATETIME_RE = re.compile(r'^\d{8}T\d{6}Z?$')
+
+
+def _format_ical_datetime(dt):
+    """Format a datetime as an iCalendar DATE-TIME, without any TZID."""
+    return '{:04d}{:02d}{:02d}T{:02d}{:02d}{:02d}'.format(
+        dt.year, dt.month, dt.day, dt.hour, dt.minute, dt.second)
+
+
+def _fold_ical_line(line):
+    """Fold a content line to 75-octet chunks (RFC 5545 section 3.1)."""
+    if len(line.encode('utf-8')) <= 75:
+        return line
+
+    chunks = []
+    chunk = ''
+    chunk_len = 0
+    limit = 75
+    for char in line:
+        char_len = len(char.encode('utf-8'))
+        if chunk_len + char_len > limit:
+            chunks.append(chunk)
+            chunk = ''
+            chunk_len = 0
+            limit = 74  # continuation lines start with a space
+        chunk += char
+        chunk_len += char_len
+    chunks.append(chunk)
+    return '\r\n '.join(chunks)
+
+
+def _unfold_ical_lines(s):
+    """Split iCalendar content into logical lines (RFC 5545 section 3.1)."""
+    lines = []
+    for raw_line in re.split(r'\r\n|\r|\n', s):
+        if not raw_line:
+            continue
+        if raw_line[0] in (' ', '\t'):
+            if not lines:
+                raise ValueError(
+                    'iCalendar content starts with a continuation line')
+            lines[-1] += raw_line[1:]
+        else:
+            lines.append(raw_line)
+    return lines
+
+
+def _format_tzid_param(tzid):
+    """Format a TZID property parameter, quoting it if necessary."""
+    if not isinstance(tzid, str) or not tzid:
+        raise ValueError('TZID names must be non-empty strings, '
+                         'got %r' % (tzid,))
+    if '"' in tzid or any(ord(c) < 32 or ord(c) == 127 for c in tzid):
+        raise ValueError('TZID name cannot be represented as an iCalendar '
+                         'parameter: %r' % (tzid,))
+    if any(c in tzid for c in ':;,'):
+        return 'TZID="%s"' % tzid
+    return 'TZID=' + tzid
+
+
+def _tzid_for_tzinfo(tzinfo, tzids):
+    """Find the registered TZID for a tzinfo, or raise a ValueError."""
+    if tzids is None:
+        raise ValueError(
+            'cannot represent tzinfo %r: no tzids registry was provided, '
+            'and substituting a fixed UTC offset would not preserve its '
+            'transition rules' % (tzinfo,))
+    items = getattr(tzids, 'items', None)
+    if items is None:
+        raise ValueError('tzids must be a mapping of TZID names to tzinfo '
+                         'objects when serializing, not %r'
+                         % type(tzids).__name__)
+    for name, registered_tz in items():
+        if registered_tz == tzinfo:
+            return name
+    raise ValueError(
+        'cannot represent tzinfo %r: it is not UTC and no TZID is '
+        'registered for it in tzids' % (tzinfo,))
+
+
+def _format_ical_property(name, dts, tzids):
+    """Build a date-time property (e.g. RDATE) for same-timezone dts."""
+    tzinfo = dts[0].tzinfo
+    if tzinfo is None or tzinfo == datetime.timezone.utc:
+        suffix = '' if tzinfo is None else 'Z'
+        values = ','.join(_format_ical_datetime(dt) + suffix for dt in dts)
+        return '%s:%s' % (name, values)
+    values = ','.join(_format_ical_datetime(dt) for dt in dts)
+    return '%s;%s:%s' % (name, _format_tzid_param(
+        _tzid_for_tzinfo(tzinfo, tzids)), values)
+
+
+def _group_by_tzinfo(dts):
+    """Group sorted datetimes by tzinfo equality."""
+    groups = []
+    for dt in dts:
+        for group_tzinfo, group in groups:
+            if group_tzinfo == dt.tzinfo:
+                group.append(dt)
+                break
+        else:
+            groups.append((dt.tzinfo, [dt]))
+    return groups
+
+
+def _rrule_ical_value(rule):
+    """The RRULE/EXRULE property value for a rule, with an RFC-compliant
+    UTC UNTIL when the rule's until is timezone-aware."""
+    value = rule._rrule_value()
+    until = rule._until
+    if until is not None and until.tzinfo is not None:
+        # RFC 5545 3.3.10: an aware UNTIL must be expressed in UTC.
+        value = value.replace(
+            until.strftime('UNTIL=%Y%m%dT%H%M%S'),
+            'UNTIL=' + _format_ical_datetime(
+                until.astimezone(datetime.timezone.utc)) + 'Z')
+    return value
+
+
+def rruleset_to_ical(rset, tzids=None):
+    """
+    Serialize an :class:`rruleset` to a restricted iCalendar (RFC 5545)
+    text representation containing its DTSTART, RRULE, RDATE, EXRULE and
+    EXDATE properties.
+
+    :param rset:
+        The :class:`rruleset` to serialize. All of its rules must share
+        the same ``dtstart``, and the set may not mix naive (floating)
+        and timezone-aware datetimes.
+
+    :param tzids:
+        A mapping of TZID names to :class:`datetime.tzinfo` objects used
+        to name the time zones of aware datetimes. UTC datetimes are
+        always written with the ``Z`` suffix and naive datetimes as
+        floating local times; any other tzinfo must be registered here,
+        by equality, or a :exc:`ValueError` is raised rather than
+        approximating it with a fixed offset.
+
+    :return:
+        A string of CRLF-separated iCalendar content lines, folded to
+        75 octets, suitable for :func:`rruleset_from_ical`.
+    """
+    if not isinstance(rset, rruleset):
+        raise TypeError('rruleset_to_ical() requires an rruleset instance, '
+                        'not %s' % type(rset).__name__)
+
+    rules = list(rset._rrule)
+    exrules = list(rset._exrule)
+    rdates = sorted(rset._rdate)
+    exdates = sorted(rset._exdate)
+
+    dtstart = None
+    for rule in rules + exrules:
+        if dtstart is None:
+            dtstart = rule._dtstart
+        elif (rule._dtstart != dtstart or
+                rule._dtstart.tzinfo != dtstart.tzinfo):
+            raise ValueError(
+                'all rules in the set must share the same DTSTART, but '
+                'found both %r and %r' % (dtstart, rule._dtstart))
+
+    all_dts = ([dtstart] if dtstart is not None else []) + rdates + exdates
+    if (any(dt.tzinfo is None for dt in all_dts) and
+            any(dt.tzinfo is not None for dt in all_dts)):
+        raise ValueError(
+            'cannot serialize a recurrence set mixing naive (floating) '
+            'and timezone-aware datetimes')
+
+    lines = []
+    if dtstart is not None:
+        lines.append(_format_ical_property('DTSTART', [dtstart], tzids))
+    for rule in rules:
+        lines.append('RRULE:' + _rrule_ical_value(rule))
+    for group_tzinfo, group in _group_by_tzinfo(rdates):
+        lines.append(_format_ical_property('RDATE', group, tzids))
+    for rule in exrules:
+        lines.append('EXRULE:' + _rrule_ical_value(rule))
+    for group_tzinfo, group in _group_by_tzinfo(exdates):
+        lines.append(_format_ical_property('EXDATE', group, tzids))
+
+    return '\r\n'.join(_fold_ical_line(line) for line in lines) + '\r\n'
+
+
+def _split_ical_head(head):
+    """Split a property name/parameter header at unquoted semicolons."""
+    parts = []
+    current = ''
+    in_quotes = False
+    for char in head:
+        if char == '"':
+            in_quotes = not in_quotes
+        if char == ';' and not in_quotes:
+            parts.append(current)
+            current = ''
+        else:
+            current += char
+    parts.append(current)
+    return parts
+
+
+def _split_ical_property(line):
+    """Split a content line into (name, params, value), where params is a
+    list of (key, value) tuples with any quoting removed."""
+    in_quotes = False
+    for i, char in enumerate(line):
+        if char == '"':
+            in_quotes = not in_quotes
+        elif char == ':' and not in_quotes:
+            head, value = line[:i], line[i + 1:]
+            break
+    else:
+        raise ValueError('invalid iCalendar content line: %r' % (line,))
+
+    parts = _split_ical_head(head)
+    name = parts[0].upper()
+    if not name:
+        raise ValueError('empty property name in line: %r' % (line,))
+
+    params = []
+    seen = set()
+    for part in parts[1:]:
+        key, sep, pvalue = part.partition('=')
+        key = key.upper()
+        if not sep or not key:
+            raise ValueError('invalid parameter %r in property %s'
+                             % (part, name))
+        if key in seen:
+            raise ValueError('duplicate %s parameter in property %s'
+                             % (key, name))
+        seen.add(key)
+        if len(pvalue) >= 2 and pvalue.startswith('"') \
+                and pvalue.endswith('"'):
+            pvalue = pvalue[1:-1]
+        params.append((key, pvalue))
+    return name, params, value
+
+
+def _lookup_tz_registry(tzid, tzids):
+    """Resolve a TZID through the caller-supplied registry."""
+    if not tzid:
+        raise ValueError('empty TZID parameter')
+    if tzids is None:
+        raise ValueError('cannot resolve TZID %r: no tzids registry was '
+                         'provided' % (tzid,))
+    if callable(tzids):
+        tzinfo = tzids(tzid)
+    else:
+        get = getattr(tzids, 'get', None)
+        if get is None:
+            raise ValueError('tzids must be a callable or a mapping, '
+                             'not %s' % type(tzids).__name__)
+        tzinfo = get(tzid)
+    if tzinfo is None:
+        raise ValueError('unknown TZID: %r' % (tzid,))
+    return tzinfo
+
+
+def _parse_ical_datetimes(prop_name, value, params, tzids):
+    """Parse the comma-separated DATE-TIME values of a property."""
+    tzid = None
+    for key, pvalue in params:
+        if key == 'TZID':
+            tzid = pvalue
+        elif key == 'VALUE':
+            if pvalue.upper() != 'DATE-TIME':
+                raise ValueError('unsupported VALUE parameter for %s: %r '
+                                 '(only DATE-TIME is supported)'
+                                 % (prop_name, pvalue))
+        else:
+            raise ValueError('unsupported %s parameter: %s=%s'
+                             % (prop_name, key, pvalue))
+
+    dts = []
+    for item in value.split(','):
+        item = item.strip().upper()
+        if not _ICAL_DATETIME_RE.match(item):
+            raise ValueError('invalid DATE-TIME value in %s: %r'
+                             % (prop_name, item))
+        if item.endswith('Z'):
+            if tzid is not None:
+                # RFC 5545 3.3.5: TZID must not be applied to UTC times.
+                raise ValueError('TZID parameter must not be applied to '
+                                 'a UTC time in %s' % prop_name)
+            tzinfo = datetime.timezone.utc
+        elif tzid is not None:
+            tzinfo = _lookup_tz_registry(tzid, tzids)
+        else:
+            tzinfo = None
+        dt = datetime.datetime.strptime(item.rstrip('Z'), '%Y%m%dT%H%M%S')
+        dts.append(dt.replace(tzinfo=tzinfo))
+    return dts
+
+
+def rruleset_from_ical(s, tzids=None, cache=False):
+    """
+    Build an :class:`rruleset` from the restricted iCalendar text
+    representation produced by :func:`rruleset_to_ical`.
+
+    :param s:
+        A string of iCalendar content lines. Only the DTSTART, RRULE,
+        RDATE, EXRULE and EXDATE properties are accepted; anything else
+        raises a :exc:`ValueError`.
+
+    :param tzids:
+        A callable or mapping used to resolve ``TZID`` parameters to
+        :class:`datetime.tzinfo` objects. No time zone database is
+        consulted implicitly: an unresolvable TZID raises a
+        :exc:`ValueError`.
+
+    :param cache:
+        If set ``True``, caching of results will be enabled on the
+        returned set.
+
+    :return:
+        Returns a :class:`dateutil.rrule.rruleset`.
+    """
+    dtstart = None
+    dtstart_seen = False
+    rrule_values = []
+    exrule_values = []
+    rdates = []
+    exdates = []
+
+    lines = _unfold_ical_lines(s)
+    if not lines:
+        raise ValueError('empty iCalendar recurrence set')
+
+    for line in lines:
+        name, params, value = _split_ical_property(line)
+
+        if name in ('RRULE', 'EXRULE'):
+            if params:
+                raise ValueError('unsupported %s parameter: %s=%s'
+                                 % ((name,) + params[0]))
+            if name == 'RRULE':
+                rrule_values.append(value)
+            else:
+                exrule_values.append(value)
+            continue
+
+        if name not in ('DTSTART', 'RDATE', 'EXDATE'):
+            raise ValueError('unsupported property: %s' % name)
+
+        if name == 'DTSTART':
+            if dtstart_seen:
+                raise ValueError('duplicate DTSTART property')
+            dtstart_seen = True
+
+        dts = _parse_ical_datetimes(name, value, params, tzids)
+        if name == 'DTSTART':
+            if len(dts) != 1:
+                raise ValueError('DTSTART must have exactly one value, '
+                                 'got %d' % len(dts))
+            dtstart = dts[0]
+        elif name == 'RDATE':
+            rdates.extend(dts)
+        else:
+            exdates.extend(dts)
+
+    all_dts = ([dtstart] if dtstart is not None else []) + rdates + exdates
+    if (any(dt.tzinfo is None for dt in all_dts) and
+            any(dt.tzinfo is not None for dt in all_dts)):
+        raise ValueError('recurrence set mixes naive (floating) and '
+                         'timezone-aware date-times')
+
+    rset = rruleset(cache=cache)
+    for value in rrule_values:
+        rset.rrule(rrulestr._parse_rfc_rrule(value.upper(), dtstart=dtstart,
+                                             cache=cache))
+    for value in exrule_values:
+        rset.exrule(rrulestr._parse_rfc_rrule(value.upper(), dtstart=dtstart,
+                                              cache=cache))
+    for dt in rdates:
+        rset.rdate(dt)
+    for dt in exdates:
+        rset.exdate(dt)
+    return rset
 
 # vim:ts=4:sw=4:et

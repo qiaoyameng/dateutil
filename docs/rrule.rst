@@ -21,6 +21,8 @@ Functions
 ---------
 
 .. autofunction:: rrulestr
+.. autofunction:: rruleset_to_ical
+.. autofunction:: rruleset_from_ical
 
 
 rrule examples

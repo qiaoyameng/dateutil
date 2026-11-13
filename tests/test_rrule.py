@@ -3,7 +3,7 @@ import itertools
 import pickle
 import threading
 import unittest
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone, tzinfo
 from functools import partial
 
 import pytest
@@ -27,6 +27,8 @@ from dateutil.rrule import (
     YEARLY,
     rrule,
     rruleset,
+    rruleset_from_ical,
+    rruleset_to_ical,
     rrulestr,
 )
 
@@ -4629,6 +4631,232 @@ def test_generated_aware_dtstart_rrulestr():
     rrule_r = rrulestr(str(rrule_without_dtstart))
 
     assert list(rrule_r) == list(rrule_without_dtstart)
+
+
+@pytest.mark.rruleset
+class RRuleSetICalTest(unittest.TestCase):
+    def testRoundTripFloating(self):
+        rrset = rruleset()
+        rrset.rrule(rrule(DAILY, count=4, dtstart=datetime(2020, 1, 1, 9, 0)))
+        rrset.rdate(datetime(2020, 1, 10, 9, 0))
+        rrset.exdate(datetime(2020, 1, 2, 9, 0))
+
+        text = rruleset_to_ical(rrset)
+        self.assertEqual(text,
+                         "DTSTART:20200101T090000\r\n"
+                         "RRULE:FREQ=DAILY;COUNT=4\r\n"
+                         "RDATE:20200110T090000\r\n"
+                         "EXDATE:20200102T090000\r\n")
+
+        restored = rruleset_from_ical(text)
+        self.assertIsInstance(restored, rruleset)
+        self.assertEqual(list(restored), list(rrset))
+        self.assertTrue(all(dt.tzinfo is None for dt in restored))
+
+    def testRoundTripUTC(self):
+        rrset = rruleset()
+        rrset.rrule(rrule(DAILY, count=3,
+                          dtstart=datetime(2020, 1, 1, 9, 0,
+                                           tzinfo=timezone.utc)))
+        rrset.exdate(datetime(2020, 1, 2, 9, 0, tzinfo=timezone.utc))
+
+        text = rruleset_to_ical(rrset)
+        self.assertEqual(text,
+                         "DTSTART:20200101T090000Z\r\n"
+                         "RRULE:FREQ=DAILY;COUNT=3\r\n"
+                         "EXDATE:20200102T090000Z\r\n")
+
+        restored = rruleset_from_ical(text)
+        self.assertEqual(list(restored), list(rrset))
+        self.assertTrue(all(dt.tzinfo == timezone.utc for dt in restored))
+
+    def testRoundTripNamedTZAcrossDST(self):
+        NYC = tz.gettz('America/New_York')
+        self.assertIsNotNone(NYC)
+        registry = {'America/New_York': NYC}
+
+        dtstart = datetime(2018, 10, 22, 9, 0, tzinfo=NYC)
+        rrset = rruleset()
+        rrset.rrule(rrule(WEEKLY, count=6, dtstart=dtstart))
+        rrset.exrule(rrule(WEEKLY, interval=2, count=3, dtstart=dtstart))
+        rrset.rdate(datetime(2018, 11, 7, 9, 0, tzinfo=NYC))
+        rrset.exdate(datetime(2018, 11, 12, 9, 0, tzinfo=NYC))
+
+        text = rruleset_to_ical(rrset, tzids=registry)
+        self.assertIn("DTSTART;TZID=America/New_York:20181022T090000", text)
+        self.assertIn("EXDATE;TZID=America/New_York:20181112T090000", text)
+
+        restored = rruleset_from_ical(text, tzids=registry)
+
+        # Compare every real instant generated in a bounded window
+        # spanning the 2018-11-04 US daylight saving transition.
+        window_start = datetime(2018, 10, 1, tzinfo=timezone.utc)
+        window_end = datetime(2018, 12, 1, tzinfo=timezone.utc)
+        expected = rrset.between(window_start, window_end, inc=True)
+        actual = restored.between(window_start, window_end, inc=True)
+        self.assertEqual(actual, expected)
+        self.assertTrue(len(actual) > 0)
+
+        # The window really does straddle the transition.
+        offsets = {dt.utcoffset() for dt in actual}
+        self.assertEqual(offsets, {timedelta(hours=-5), timedelta(hours=-4)})
+
+    def testRoundTripMultipleRRules(self):
+        rrset = rruleset()
+        rrset.rrule(rrule(WEEKLY, count=4, byweekday=TU,
+                          dtstart=datetime(1997, 9, 2, 9, 0)))
+        rrset.rrule(rrule(WEEKLY, count=4, byweekday=TH,
+                          dtstart=datetime(1997, 9, 2, 9, 0)))
+
+        restored = rruleset_from_ical(rruleset_to_ical(rrset))
+        self.assertEqual(list(restored), list(rrset))
+
+    def testRoundTripAwareUntil(self):
+        rrset = rruleset()
+        rrset.rrule(rrule(DAILY,
+                          dtstart=datetime(2020, 1, 1, 9, 0,
+                                           tzinfo=timezone.utc),
+                          until=datetime(2020, 1, 5, 9, 0,
+                                         tzinfo=timezone.utc)))
+
+        text = rruleset_to_ical(rrset)
+        self.assertIn("UNTIL=20200105T090000Z", text)
+        self.assertEqual(list(rruleset_from_ical(text)), list(rrset))
+
+    def testLineFolding(self):
+        rrset = rruleset()
+        rrset.rrule(rrule(DAILY, count=30,
+                          dtstart=datetime(2020, 1, 1, 9, 0)))
+        for day in range(2, 20):
+            rrset.exdate(datetime(2020, 1, day, 9, 0))
+
+        text = rruleset_to_ical(rrset)
+        for line in text.split('\r\n'):
+            self.assertLessEqual(len(line.encode('utf-8')), 75)
+        self.assertIn('\r\n ', text)
+
+        self.assertEqual(list(rruleset_from_ical(text)), list(rrset))
+
+    def testQuotedTZIDRoundTrip(self):
+        odd_tz = tz.tzoffset('ODD', 3600)
+        registry = {'Custom:Zone,1': odd_tz}
+
+        rrset = rruleset()
+        rrset.rrule(rrule(DAILY, count=3,
+                          dtstart=datetime(2020, 1, 1, 9, 0, tzinfo=odd_tz)))
+
+        text = rruleset_to_ical(rrset, tzids=registry)
+        self.assertIn('DTSTART;TZID="Custom:Zone,1":20200101T090000', text)
+        self.assertEqual(list(rruleset_from_ical(text, tzids=registry)),
+                         list(rrset))
+
+    def testFromICalCallableTZIDs(self):
+        rrset = rruleset()
+        rrset.rrule(rrule(DAILY, count=3,
+                          dtstart=datetime(2020, 1, 1, 9, 0,
+                                           tzinfo=timezone.utc)))
+
+        text = ("DTSTART;TZID=UTC+04:20200101T090000\r\n"
+                "RRULE:FREQ=DAILY;COUNT=3\r\n")
+        restored = rruleset_from_ical(text, tzids=tz.tzstr)
+        self.assertEqual(list(restored),
+                         list(rruleset_from_ical(
+                             text, tzids={'UTC+04': tz.tzstr('UTC+04')})))
+
+    def testFromICalUnknownTZID(self):
+        text = ("DTSTART;TZID=Not/AZone:20200101T090000\r\n"
+                "RRULE:FREQ=DAILY;COUNT=1\r\n")
+        with self.assertRaisesRegex(ValueError, "unknown TZID"):
+            rruleset_from_ical(text, tzids={'America/New_York': tz.gettz()})
+
+    def testFromICalTZIDWithoutRegistry(self):
+        text = ("DTSTART;TZID=America/New_York:20200101T090000\r\n"
+                "RRULE:FREQ=DAILY;COUNT=1\r\n")
+        with self.assertRaisesRegex(ValueError, "no tzids registry"):
+            rruleset_from_ical(text)
+
+    def testFromICalMixedNaiveAndAware(self):
+        text = ("DTSTART:20200101T090000Z\r\n"
+                "RRULE:FREQ=DAILY;COUNT=2\r\n"
+                "EXDATE:20200102T090000\r\n")
+        with self.assertRaisesRegex(ValueError, "mixes naive"):
+            rruleset_from_ical(text)
+
+    def testFromICalDuplicateDTStart(self):
+        text = ("DTSTART:20200101T090000\r\n"
+                "DTSTART:20200102T090000\r\n"
+                "RRULE:FREQ=DAILY;COUNT=1\r\n")
+        with self.assertRaisesRegex(ValueError, "duplicate DTSTART"):
+            rruleset_from_ical(text)
+
+    def testFromICalDuplicateParameter(self):
+        text = ("DTSTART;VALUE=DATE-TIME;VALUE=DATE-TIME:20200101T090000\r\n"
+                "RRULE:FREQ=DAILY;COUNT=1\r\n")
+        with self.assertRaisesRegex(ValueError, "duplicate VALUE"):
+            rruleset_from_ical(text)
+
+    def testFromICalUnsupportedProperty(self):
+        with self.assertRaisesRegex(ValueError, "unsupported property"):
+            rruleset_from_ical("BEGIN:VEVENT\r\n"
+                               "RRULE:FREQ=DAILY;COUNT=1\r\n")
+
+    def testFromICalUnsupportedValueParam(self):
+        text = ("DTSTART;VALUE=DATE:20200101\r\n"
+                "RRULE:FREQ=DAILY;COUNT=1\r\n")
+        with self.assertRaisesRegex(ValueError, "only DATE-TIME"):
+            rruleset_from_ical(text)
+
+    def testFromICalTZIDOnUTCTime(self):
+        text = ("DTSTART;TZID=America/New_York:20200101T090000Z\r\n"
+                "RRULE:FREQ=DAILY;COUNT=1\r\n")
+        with self.assertRaisesRegex(ValueError, "must not be applied"):
+            rruleset_from_ical(text, tzids=tz.gettz)
+
+    def testFromICalEmpty(self):
+        with self.assertRaisesRegex(ValueError, "empty"):
+            rruleset_from_ical("")
+
+    def testToICalUnregisteredTZ(self):
+        class CustomTZ(tzinfo):
+            def utcoffset(self, dt):
+                return timedelta(hours=8)
+
+            def dst(self, dt):
+                return timedelta(0)
+
+        rrset = rruleset()
+        rrset.rrule(rrule(DAILY, count=1,
+                          dtstart=datetime(2020, 1, 1, 9, 0,
+                                           tzinfo=CustomTZ())))
+
+        # The current offset must not be silently substituted for a
+        # time zone that cannot be named.
+        with self.assertRaisesRegex(ValueError, "no tzids registry"):
+            rruleset_to_ical(rrset)
+        with self.assertRaisesRegex(ValueError, "cannot represent"):
+            rruleset_to_ical(rrset, tzids={'America/New_York': tz.gettz()})
+
+    def testToICalMixedNaiveAndAware(self):
+        rrset = rruleset()
+        rrset.rrule(rrule(DAILY, count=2,
+                          dtstart=datetime(2020, 1, 1, 9, 0)))
+        rrset.rdate(datetime(2020, 1, 5, 9, 0, tzinfo=timezone.utc))
+        with self.assertRaisesRegex(ValueError, "mixing naive"):
+            rruleset_to_ical(rrset)
+
+    def testToICalConflictingDTStarts(self):
+        rrset = rruleset()
+        rrset.rrule(rrule(DAILY, count=2,
+                          dtstart=datetime(2020, 1, 1, 9, 0)))
+        rrset.rrule(rrule(DAILY, count=2,
+                          dtstart=datetime(2020, 1, 2, 9, 0)))
+        with self.assertRaisesRegex(ValueError, "same DTSTART"):
+            rruleset_to_ical(rrset)
+
+    def testToICalRequiresRRuleSet(self):
+        with self.assertRaises(TypeError):
+            rruleset_to_ical(rrule(DAILY, count=1,
+                                   dtstart=datetime(2020, 1, 1, 9, 0)))
 
 
 @pytest.mark.rruleset
