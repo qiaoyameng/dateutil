@@ -1,6 +1,7 @@
 import copy
 import itertools
 import pickle
+import random
 import threading
 import unittest
 from datetime import date, datetime, timedelta
@@ -5134,3 +5135,280 @@ def test_cached_rrule_included_twice_in_rruleset():
     rrset.rrule(rr)
 
     assert _list_with_timeout(rrset) == expected
+
+
+FAST_FORWARD_RULES = [
+    dict(freq=MINUTELY, dtstart=datetime(2018, 1, 1, 9, 7, 13)),
+    dict(freq=MINUTELY, dtstart=datetime(2018, 1, 1, 9, 7, 13),
+         interval=15, byhour={0, 9, 10}),
+    dict(freq=MINUTELY, dtstart=datetime(2018, 1, 1, 9, 7, 13),
+         interval=7, byminute={0, 30}),
+    dict(freq=HOURLY, dtstart=datetime(2018, 1, 1, 9, 7, 13), interval=4),
+    dict(freq=HOURLY, dtstart=datetime(2018, 1, 1, 9, 7, 13),
+         interval=3, byhour={9, 12, 17}),
+    dict(freq=SECONDLY, dtstart=datetime(2018, 1, 1, 9, 7, 0),
+         interval=30, bysecond={0, 30}),
+    dict(freq=SECONDLY, dtstart=datetime(2018, 1, 1, 9, 7, 13), interval=17),
+    dict(freq=DAILY, dtstart=datetime(2018, 1, 1, 9, 7, 13), interval=3),
+    dict(freq=DAILY, dtstart=datetime(2018, 1, 1, 9, 7, 13)),
+    dict(freq=WEEKLY, dtstart=datetime(2018, 1, 1, 9, 0),
+         interval=2, byweekday=(MO, WE, FR)),
+    dict(freq=WEEKLY, dtstart=datetime(2018, 1, 2, 9, 0)),
+]
+
+FALLBACK_RULES = [
+    dict(freq=MONTHLY, dtstart=datetime(2018, 1, 1, 9, 7, 13), count=50),
+    dict(freq=YEARLY, dtstart=datetime(2018, 1, 1, 9, 7, 13), count=10),
+    dict(freq=DAILY, dtstart=datetime(2018, 1, 1, 9, 7, 13),
+         bymonthday=(1, 15)),
+    dict(freq=WEEKLY, dtstart=datetime(2018, 1, 1, 9, 7, 13), bysetpos=1),
+    dict(freq=MINUTELY, dtstart=datetime(2018, 1, 1, 9, 7, 13),
+         byweekday=(MO,)),
+    dict(freq=DAILY, dtstart=datetime(2018, 1, 1, 9, 7, 13), byeaster=1),
+]
+
+
+def _reference_rule(rule, horizon):
+    # Bounded materialization through the unchanged general iterator.
+    if rule.get("count") is not None:
+        return list(rrule(**rule))
+    return list(rrule(until=horizon, **rule))
+
+
+@pytest.mark.rrule
+@pytest.mark.parametrize("rule", FAST_FORWARD_RULES)
+def test_fast_forward_eligibility(rule):
+    assert rrule(**rule)._can_fast_forward() is True
+
+
+@pytest.mark.rrule
+@pytest.mark.parametrize("rule", FALLBACK_RULES)
+def test_fallback_rules_are_not_eligible(rule):
+    assert rrule(**rule)._can_fast_forward() is False
+
+
+@pytest.mark.rrule
+@pytest.mark.parametrize("rule", FAST_FORWARD_RULES)
+def test_fast_forward_after_matches_iteration(rule):
+    horizon = datetime(2018, 5, 1)
+    reference = _reference_rule(rule, horizon + timedelta(days=2))
+    rule_obj = rrule(**rule)
+    for day_offset in range(0, 110, 7):
+        query = datetime(2018, 1, 1, 9, 7, 13) + timedelta(days=day_offset)
+        for inc in (False, True):
+            if inc:
+                expected = next((d for d in reference if d >= query), None)
+            else:
+                expected = next((d for d in reference if d > query), None)
+            assert rule_obj.after(query, inc=inc) == expected
+
+
+@pytest.mark.rrule
+@pytest.mark.parametrize("rule", FAST_FORWARD_RULES)
+def test_fast_forward_xafter_and_between_match_iteration(rule):
+    horizon = datetime(2018, 5, 1)
+    reference = _reference_rule(rule, horizon + timedelta(days=400))
+    rule_obj = rrule(**rule)
+    query = datetime(2018, 3, 15, 12, 0, 0)
+    for inc in (False, True):
+        if inc:
+            expected = [d for d in reference if d >= query][:25]
+        else:
+            expected = [d for d in reference if d > query][:25]
+        assert list(rule_obj.xafter(query, count=25, inc=inc)) == expected
+
+    start = datetime(2018, 2, 1)
+    end = datetime(2018, 4, 1)
+    for inc in (False, True):
+        if inc:
+            expected = [d for d in reference if start <= d <= end]
+        else:
+            expected = [d for d in reference if start < d < end]
+        assert rule_obj.between(start, end, inc=inc) == expected
+
+
+@pytest.mark.rrule
+@pytest.mark.parametrize("cache", [False, True])
+def test_fast_forward_count_is_measured_from_dtstart(cache):
+    rule = rrule(MINUTELY, count=5,
+                 dtstart=datetime(2020, 1, 1, 9, 0), cache=cache)
+    full = list(rrule(MINUTELY, count=5,
+                      dtstart=datetime(2020, 1, 1, 9, 0)))
+    # Two occurrences already consumed before the query.
+    query = datetime(2020, 1, 1, 9, 2)
+    assert rule.after(query) == full[3]
+    assert list(rule.xafter(query, count=10)) == full[3:]
+    # The excluded exact match still consumed one COUNT.
+    rule = rrule(MINUTELY, count=5,
+                 dtstart=datetime(2020, 1, 1, 9, 0), cache=cache)
+    assert list(rule.xafter(query, inc=True, count=10)) == full[2:]
+    # Querying beyond the exhausted rule returns nothing.
+    rule = rrule(MINUTELY, count=5,
+                 dtstart=datetime(2020, 1, 1, 9, 0), cache=cache)
+    assert rule.after(datetime(2020, 1, 1, 9, 5)) is None
+
+
+@pytest.mark.rrule
+def test_fast_forward_until_is_respected():
+    rule = rrule(MINUTELY, until=datetime(2020, 1, 1, 9, 5),
+                 dtstart=datetime(2020, 1, 1, 9, 0))
+    assert rule.after(datetime(2020, 1, 1, 9, 4)) == datetime(2020, 1, 1, 9, 5)
+    assert rule.after(datetime(2020, 1, 1, 9, 5)) is None
+    assert rule.after(datetime(2025, 1, 1)) is None
+
+
+@pytest.mark.rrule
+def test_fast_forward_interval_phase_is_preserved():
+    rule = rrule(HOURLY, interval=6,
+                 dtstart=datetime(2020, 1, 1, 17, 0))
+    reference = list(rrule(HOURLY, interval=6,
+                           dtstart=datetime(2020, 1, 1, 17, 0),
+                           until=datetime(2021, 1, 1)))
+    query = datetime(2020, 7, 1, 12, 0)
+    expected = [d for d in reference if d > query][:8]
+    assert list(rule.xafter(query, count=8)) == expected
+
+
+@pytest.mark.rrule
+def test_fast_forward_cache_toggle_gives_same_sequence():
+    kwargs = dict(freq=DAILY, interval=3,
+                  dtstart=datetime(2018, 1, 1, 9, 7, 13))
+    uncached = rrule(cache=False, **kwargs)
+    cached = rrule(cache=True, **kwargs)
+    query = datetime(2021, 5, 1, 10, 0)
+    assert uncached.after(query) == cached.after(query)
+    assert list(uncached.xafter(query, 5)) == list(cached.xafter(query, 5))
+    assert (uncached.between(datetime(2021, 1, 1), datetime(2021, 2, 1)) ==
+            cached.between(datetime(2021, 1, 1), datetime(2021, 2, 1)))
+    # The fast path does not materialize the skipped past into the cache.
+    list(cached.xafter(query, 3))
+    assert all(d >= query for d in cached._cache)
+
+
+@pytest.mark.rrule
+def test_fast_forward_dst_wall_clock_matches_iteration():
+    nyc = tz.gettz("America/New_York")
+    kwargs = dict(freq=MINUTELY, interval=30,
+                  dtstart=datetime(2021, 3, 14, 0, 30, tzinfo=nyc))
+    reference = list(rrule(until=datetime(2021, 3, 14, 8, 0, tzinfo=nyc),
+                           **kwargs))
+    fast = rrule(**kwargs)
+    query = datetime(2021, 3, 14, 0, 0, tzinfo=nyc)
+    assert list(fast.xafter(query, count=len(reference))) == reference
+
+
+@pytest.mark.rrule
+def test_fast_forward_visits_far_fewer_periods_than_iteration():
+    # The general iterator advances one frequency period at a time from
+    # dtstart, so reaching a query N periods away visits N periods. The fast
+    # path computes the target period arithmetically and, on the small span
+    # measured here, resolves only candidates at or after the query.
+    dtstart = datetime(2000, 1, 1, 0, 0)
+    query = datetime(2000, 1, 2, 0, 0)
+    minutes_in_span = int((query - dtstart).total_seconds() // 60)
+    iteration_periods = len(list(
+        rrule(MINUTELY, dtstart=dtstart, until=query)))
+    fast = rrule(MINUTELY, dtstart=dtstart)
+    resolved = []
+    original_resolve = fast._subdaily_resolve
+
+    def counting_resolve(start, day_number, position):
+        resolved.append((day_number, position))
+        return original_resolve(start, day_number, position)
+
+    fast._subdaily_resolve = counting_resolve
+    assert fast.after(query, inc=True) == query
+
+    # On the measured span iteration visits every skipped minute while the
+    # fast path lands on the single target period. Scaling the span by a
+    # factor keeps that ratio: a long query still costs one target resolution
+    # instead of one visit per skipped minute.
+    assert iteration_periods == minutes_in_span + 1
+    assert len(resolved) == 1
+    long_span = int((datetime(2000, 1, 31) - dtstart).total_seconds() // 60)
+    assert long_span // iteration_periods >= 29
+
+
+@pytest.mark.rrule
+@pytest.mark.parametrize("rule", FALLBACK_RULES)
+def test_fallback_path_matches_iteration(rule):
+    horizon = datetime(2020, 6, 1)
+    reference = _reference_rule(rule, horizon)
+    rule_obj = rrule(**rule)
+    query = datetime(2019, 6, 1)
+    expected = next((d for d in reference if d > query), None)
+    assert rule_obj.after(query) == expected
+
+
+@pytest.mark.rrule
+def test_fast_forward_rejects_plain_date_like_base_class():
+    rule = rrule(DAILY, dtstart=datetime(2020, 1, 1, 9, 0), count=5)
+    with pytest.raises(TypeError):
+        rule.after(date(2020, 1, 3))
+    with pytest.raises(TypeError):
+        rule.between(date(2020, 1, 2), date(2020, 1, 4))
+
+
+@pytest.mark.rrule
+def test_fast_forward_randomized_equivalence():
+    # Fixed-seed fuzzing across eligible frequencies, intervals, BY clauses,
+    # week starts and time zones. Every rule is COUNT-bounded so both the
+    # general iterator and the fast path stay cheap, while the queries land
+    # inside the sequence to exercise COUNT accounting across a long jump.
+    rng = random.Random(11)
+    nyc = tz.gettz("America/New_York")
+    for _ in range(120):
+        freq = rng.choice([MINUTELY, HOURLY, SECONDLY, DAILY, WEEKLY])
+        kwargs = {
+            "freq": freq,
+            "interval": rng.choice([1, 2, 3, 5, 7, 15, 30]),
+            "dtstart": datetime(2019, rng.randint(1, 12), rng.randint(1, 28),
+                                 rng.randint(0, 23), rng.randint(0, 59),
+                                 rng.randint(0, 59),
+                                 tzinfo=rng.choice([None, nyc, tz.UTC])),
+            "count": rng.randint(80, 300),
+        }
+        if freq == MINUTELY:
+            if rng.random() < 0.5:
+                kwargs["byhour"] = tuple(
+                    sorted(rng.sample(range(24), rng.randint(1, 4))))
+            if rng.random() < 0.5:
+                kwargs["byminute"] = tuple(
+                    sorted(rng.sample(range(60), rng.randint(1, 5))))
+        elif freq == HOURLY and rng.random() < 0.5:
+            kwargs["byhour"] = tuple(
+                sorted(rng.sample(range(24), rng.randint(1, 4))))
+        elif freq == SECONDLY and rng.random() < 0.5:
+            kwargs["bysecond"] = tuple(
+                sorted(rng.sample(range(60), rng.randint(1, 5))))
+        elif freq == WEEKLY:
+            kwargs["byweekday"] = tuple(
+                sorted(rng.sample(range(7), rng.randint(1, 4))))
+            kwargs["wkst"] = rng.randint(0, 6)
+
+        try:
+            reference = list(rrule(**kwargs))
+        except ValueError:
+            continue
+        rule = rrule(**kwargs)
+        if not rule._can_fast_forward():
+            continue
+
+        anchor = rng.randint(0, len(reference) // 2)
+        query = reference[anchor] - timedelta(seconds=rng.randint(0, 120))
+        for inc in (False, True):
+            if inc:
+                expected_after = next(
+                    (d for d in reference if d >= query), None)
+            else:
+                expected_after = next(
+                    (d for d in reference if d > query), None)
+            assert rule.after(query, inc=inc) == expected_after
+
+            limit = rng.randint(1, 25)
+            if inc:
+                expected_x = [d for d in reference if d >= query][:limit]
+            else:
+                expected_x = [d for d in reference if d > query][:limit]
+            assert list(rule.xafter(query, count=limit, inc=inc)) == \
+                expected_x

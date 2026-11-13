@@ -1123,6 +1123,433 @@ class rrule(rrulebase):
             if value in byxxx:
                 return (accumulator, value)
 
+    def _can_fast_forward(self):
+        """
+        Whether :meth:`after`, :meth:`xafter` and :meth:`between` may skip
+        straight to the frequency period containing the queried date.
+
+        Rules whose output depends on filters evaluated inside a frequency
+        period (``BYSETPOS``, ``BYWEEKNO``, ``BYYEARDAY``, ``BYEASTER``,
+        indexed weekdays, ...) cannot be proven period-independent and keep
+        using the fully general :meth:`_iter` path.
+        """
+        freq = self._freq
+        if self._bysetpos is not None:
+            return False
+        if freq == DAILY or freq >= HOURLY:
+            return not (self._bymonth or self._bymonthday or
+                        self._bynmonthday or self._byyearday or
+                        self._byweekno or self._byeaster or
+                        self._byweekday or self._bynweekday)
+        if freq == WEEKLY:
+            return not (self._bymonth or self._bymonthday or
+                        self._bynmonthday or self._byyearday or
+                        self._byweekno or self._byeaster or
+                        self._bynweekday)
+        return False
+
+    def _fast_forward_iter(self, dt, inc=False):
+        """
+        Yield the rule's occurrences at or after ``dt`` without materializing
+        the occurrences between :attr:`_dtstart` and ``dt``.
+
+        The skipped rules are exactly those accepted by
+        :meth:`_can_fast_forward`, so each frequency period is either empty
+        or emits the same occurrences as :meth:`_iter`. The interval phase,
+        ``COUNT``/``UNTIL`` limits and timezone handling are identical to the
+        standard iteration path.
+        """
+        freq = self._freq
+        if freq >= HOURLY:
+            yield from self._fast_forward_subdaily(dt, inc)
+        elif freq == DAILY:
+            yield from self._fast_forward_daily(dt, inc)
+        else:
+            yield from self._fast_forward_weekly(dt, inc)
+
+    def _fast_forward_emit(self, res, query_dt, inc, count):
+        """
+        Returns ``(count, action)`` where ``action`` is one of ``"skip"``
+        (filtered candidate, keep scanning), ``"yield"`` (emit the
+        candidate), ``"yield_stop"`` (emit and then the COUNT budget is
+        exhausted) or ``"stop"`` (the rule is exhausted).
+        """
+        if self._until is not None and res > self._until:
+            return count, "stop"
+        if res < self._dtstart:
+            return count, "skip"
+        if res < query_dt or (not inc and res == query_dt):
+            return count, "skip"
+        if count is not None:
+            if count == 0:
+                return count, "stop"
+            count -= 1
+            if count == 0:
+                return count, "yield_stop"
+        return count, "yield"
+
+    def _count_occurrences_before(self, query_dt, inc):
+        """
+        Number of COUNT occurrences consumed before the fast path starts.
+
+        This preserves the COUNT semantics of :meth:`_iter`, whose counter
+        starts at :attr:`_dtstart`, even though the fast path never
+        materializes those earlier occurrences. When ``inc`` is false, an
+        occurrence equal to the query still consumed a COUNT even though it is
+        not emitted.
+        """
+        freq = self._freq
+        if freq >= HOURLY:
+            return self._count_subdaily_before(query_dt, inc)
+        if freq == DAILY:
+            return self._count_daily_before(query_dt, inc)
+        return self._count_weekly_before(query_dt, inc)
+
+    def _count_daily_before(self, query_dt, inc):
+        start = self._dtstart
+        interval = self._interval
+        per_day = len(self._timeset)
+        day0 = start.date().toordinal()
+        qday = query_dt.date().toordinal()
+        if qday < day0:
+            return 0
+        # Active days are day0 + k*interval. Count those strictly before the
+        # query's day, each contributing all of the rule's times.
+        active_days_before = (qday - day0) // interval
+        total = active_days_before * per_day
+        if (qday - day0) % interval == 0:
+            day = datetime.date.fromordinal(qday)
+            for time in self._timeset:
+                res = datetime.datetime.combine(day, time)
+                if res < query_dt or (not inc and res == query_dt):
+                    total += 1
+        return total
+
+    def _count_weekly_before(self, query_dt, inc):
+        start = self._dtstart
+        interval = self._interval
+        wkst = self._wkst
+        timeset = self._timeset
+        start_date = start.date()
+        period0 = start_date - datetime.timedelta(
+            days=(start_date.weekday() - wkst) % 7)
+        ordinal0 = period0.toordinal()
+        q_period = query_dt.date() - datetime.timedelta(
+            days=(query_dt.date().weekday() - wkst) % 7)
+        q_ordinal = q_period.toordinal()
+        if q_ordinal < ordinal0:
+            return 0
+        period_index = (q_ordinal - ordinal0) // (7 * interval)
+        # Count whole active periods strictly before the query's period.
+        total = period_index * len(self._byweekday) * len(timeset)
+        # Count occurrences inside the query's period that precede it.
+        first = datetime.date.fromordinal(
+            ordinal0 + period_index * 7 * interval)
+        for offset in sorted((wday - wkst) % 7
+                             for wday in self._byweekday):
+            day = first + datetime.timedelta(days=offset)
+            for time in timeset:
+                res = datetime.datetime.combine(day, time)
+                if res < query_dt or (not inc and res == query_dt):
+                    total += 1
+        return total
+
+    def _count_subdaily_before(self, query_dt, inc):
+        freq = self._freq
+        start = self._dtstart
+        interval = self._interval
+        if freq == HOURLY:
+            base = 24
+        elif freq == MINUTELY:
+            base = 24 * 60
+        else:
+            base = 24 * 3600
+        index0 = self._subdaily_index(start)
+        # First period index that the fast path may emit. When inc is false,
+        # the period landing exactly on the query is consumed but not emitted.
+        first_index = self._subdaily_query_index(query_dt, inc)
+        if first_index <= index0:
+            return 0
+        # k ranges over anchored periods strictly before first_index; the
+        # query-index helper already moved past an excluded exact match.
+        last_k = (first_index - index0 - 1) // interval
+        minute_set = self._byminute
+        second_set = self._bysecond
+        byhour = self._byhour
+        total = 0
+        for k in range(last_k + 1):
+            index = index0 + k * interval
+            day_number, position = divmod(index, base)
+            if freq == HOURLY:
+                valid = byhour is None or position in byhour
+            elif freq == MINUTELY:
+                hour, minute = divmod(position, 60)
+                valid = ((byhour is None or hour in byhour) and
+                         (not minute_set or minute in minute_set))
+            else:
+                hour, rem = divmod(position, 3600)
+                minute, second = divmod(rem, 60)
+                valid = ((not byhour or hour in byhour) and
+                         (not minute_set or minute in minute_set) and
+                         (not second_set or second in second_set))
+            if valid:
+                total += 1
+        return total
+
+    def _fast_forward_daily(self, query_dt, inc):
+        start = self._dtstart
+        interval = self._interval
+        timeset = self._timeset
+        count = self._count
+        if count is not None:
+            count = max(0,
+                        count - self._count_occurrences_before(query_dt, inc))
+
+        day0 = start.date().toordinal()
+        qday = query_dt.date().toordinal()
+        if qday >= day0:
+            k = (qday - day0 + interval - 1) // interval
+        else:
+            k = -((day0 - qday) // interval)
+
+        while True:
+            ordinal = day0 + k * interval
+            if ordinal > datetime.date.max.toordinal():
+                return
+            day = datetime.date.fromordinal(ordinal)
+            for time in timeset:
+                res = datetime.datetime.combine(day, time)
+                count, action = self._fast_forward_emit(
+                    res, query_dt, inc, count)
+                if action == "stop":
+                    return
+                if action == "yield_stop":
+                    yield res
+                    return
+                if action == "yield":
+                    yield res
+            k += 1
+
+    def _fast_forward_weekly(self, query_dt, inc):
+        start = self._dtstart
+        interval = self._interval
+        wkst = self._wkst
+        # Order weekday offsets from the week start so that days crossing the
+        # week boundary are emitted in chronological order, matching _iter.
+        weekday_offsets = sorted((wday - wkst) % 7
+                                 for wday in self._byweekday)
+        timeset = self._timeset
+        count = self._count
+        if count is not None:
+            count = max(0,
+                        count - self._count_occurrences_before(query_dt, inc))
+
+        start_date = start.date()
+        period0 = start_date - datetime.timedelta(
+            days=(start_date.weekday() - wkst) % 7)
+        ordinal0 = period0.toordinal()
+        q_period = query_dt.date() - datetime.timedelta(
+            days=(query_dt.date().weekday() - wkst) % 7)
+        q_ordinal = q_period.toordinal()
+
+        if q_ordinal >= ordinal0:
+            k = (q_ordinal - ordinal0 + 7 * interval - 1) // (7 * interval)
+        else:
+            k = -((ordinal0 - q_ordinal) // (7 * interval))
+
+        while True:
+            first = datetime.date.fromordinal(ordinal0 + k * 7 * interval)
+            if first.toordinal() > datetime.date.max.toordinal() - 6:
+                return
+            for offset in weekday_offsets:
+                day = first + datetime.timedelta(days=offset)
+                for time in timeset:
+                    res = datetime.datetime.combine(day, time)
+                    count, action = self._fast_forward_emit(
+                        res, query_dt, inc, count)
+                    if action == "stop":
+                        return
+                    if action == "yield_stop":
+                        yield res
+                        return
+                    if action == "yield":
+                        yield res
+            k += 1
+
+    def _fast_forward_subdaily(self, query_dt, inc):
+        freq = self._freq
+        start = self._dtstart
+        interval = self._interval
+        count = self._count
+        if count is not None:
+            count = max(0,
+                        count - self._count_occurrences_before(query_dt, inc))
+
+        if freq == HOURLY:
+            base = 24
+            byxxx = self._byhour
+        elif freq == MINUTELY:
+            base = 24 * 60
+            byxxx = self._byhour
+            if not self._subdaily_has_occurrences(base):
+                raise ValueError(
+                    'Invalid combination of interval and byhour '
+                    'resulting in empty rule.')
+        else:
+            base = 24 * 3600
+            byxxx = None
+
+        index0 = self._subdaily_index(start)
+        q_index = self._subdaily_query_index(query_dt, inc)
+        if q_index >= index0:
+            k = (q_index - index0 + interval - 1) // interval
+        else:
+            k = -((index0 - q_index) // interval)
+
+        minute_set = self._byminute
+        second_set = self._bysecond
+
+        while True:
+            index = index0 + k * interval
+            day_number, position = divmod(index, base)
+            if freq == HOURLY:
+                valid = byxxx is None or position in byxxx
+            elif freq == MINUTELY:
+                hour, minute = divmod(position, 60)
+                valid = ((byxxx is None or hour in byxxx) and
+                         (not minute_set or minute in minute_set))
+            else:
+                hour, rem = divmod(position, 3600)
+                minute, second = divmod(rem, 60)
+                valid = ((not self._byhour or hour in self._byhour) and
+                         (not minute_set or minute in minute_set) and
+                         (not second_set or second in second_set))
+
+            if valid:
+                res = self._subdaily_resolve(
+                    start,
+                    day_number - start.date().toordinal(),
+                    position)
+                if res is None:
+                    return
+                count, action = self._fast_forward_emit(
+                    res, query_dt, inc, count)
+                if action == "stop":
+                    return
+                if action == "yield_stop":
+                    yield res
+                    return
+                if action == "yield":
+                    yield res
+            k += 1
+
+    def _subdaily_has_occurrences(self, base):
+        gcd = math.gcd(self._interval, base)
+        phase = self._subdaily_index(self._dtstart) % gcd
+        if self._freq == MINUTELY:
+            allowed_hours = self._byhour or range(24)
+            allowed_minutes = self._byminute or range(60)
+            return any((hour * 60 + minute) % gcd == phase
+                       for hour in allowed_hours
+                       for minute in allowed_minutes)
+        return False
+
+    def _subdaily_index(self, dt):
+        freq = self._freq
+        if freq == HOURLY:
+            return dt.date().toordinal() * 24 + dt.hour
+        if freq == MINUTELY:
+            return dt.date().toordinal() * 24 * 60 + dt.hour * 60 + dt.minute
+        return (dt.date().toordinal() * 24 * 3600 +
+                dt.hour * 3600 + dt.minute * 60 + dt.second)
+
+    def _subdaily_query_index(self, dt, inc):
+        """
+        Absolute index of the frequency period containing ``dt``.
+
+        Components below the frequency (e.g. seconds for MINUTELY, minutes and
+        seconds for HOURLY) are fixed for the rule and taken from
+        :attr:`_dtstart`, so the query is projected onto the anchored phase
+        rather than onto an arbitrary position inside a period.
+        """
+        freq = self._freq
+        day = dt.date().toordinal()
+        if freq == HOURLY:
+            period_index = day * 24 + dt.hour
+            fixed_position = self._dtstart.minute * 60 + self._dtstart.second
+            query_position = dt.minute * 60 + dt.second
+            if query_position > fixed_position or (
+                    not inc and query_position == fixed_position):
+                period_index += 1
+            return period_index
+        if freq == MINUTELY:
+            period_index = day * 24 * 60 + dt.hour * 60 + dt.minute
+            if dt.second > self._dtstart.second or (
+                    not inc and dt.second == self._dtstart.second):
+                period_index += 1
+            return period_index
+        # SECONDLY: every second is its own frequency period.
+        index = self._subdaily_index(dt)
+        if not inc:
+            index += 1
+        return index
+
+    def _subdaily_resolve(self, start, day_number, position):
+        freq = self._freq
+        start_ordinal = start.date().toordinal()
+        ordinal = start_ordinal + day_number
+        if ordinal > datetime.date.max.toordinal():
+            return None
+        day = datetime.date.fromordinal(ordinal)
+        if freq == HOURLY:
+            time = datetime.time(position, start.minute, start.second,
+                                 tzinfo=self._tzinfo)
+        elif freq == MINUTELY:
+            hour, minute = divmod(position, 60)
+            time = datetime.time(hour, minute, start.second,
+                                 tzinfo=self._tzinfo)
+        else:
+            hour, rem = divmod(position, 3600)
+            minute, second = divmod(rem, 60)
+            time = datetime.time(hour, minute, second,
+                                 tzinfo=self._tzinfo)
+        return datetime.datetime.combine(day, time)
+
+    def _use_fast_path(self, *queries):
+        if self._cache_complete or not self._can_fast_forward():
+            return False
+        return all(isinstance(query, datetime.datetime) for query in queries)
+
+    def after(self, dt, inc=False):
+        if not self._use_fast_path(dt):
+            return super().after(dt, inc)
+        for res in self._fast_forward_iter(dt, inc):
+            return res
+        return None
+
+    def xafter(self, dt, count=None, inc=False):
+        if not self._use_fast_path(dt):
+            yield from super().xafter(dt, count, inc)
+            return
+        n = 0
+        for res in self._fast_forward_iter(dt, inc):
+            if count is not None:
+                if n >= count:
+                    break
+                n += 1
+            yield res
+
+    def between(self, after, before, inc=False, count=1):
+        if not self._use_fast_path(after, before):
+            return super().between(after, before, inc, count)
+        results = []
+        for res in self._fast_forward_iter(after, True):
+            if (res > before) or (not inc and res >= before):
+                break
+            if (res >= after) if inc else (res > after):
+                results.append(res)
+        return results
+
 
 class _iterinfo:
     __slots__ = ["rrule", "lastyear", "lastmonth",
