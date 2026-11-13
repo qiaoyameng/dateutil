@@ -15,6 +15,7 @@ new_locals.pop('prev_locals')
 def test_imported_modules():
     """ Test that `from dateutil import *` adds modules in __all__ locally """
     import dateutil.easter
+    import dateutil.anchor
     import dateutil.parser
     import dateutil.relativedelta
     import dateutil.rrule
@@ -22,6 +23,7 @@ def test_imported_modules():
     import dateutil.utils
 
     assert dateutil.easter == new_locals.pop("easter")
+    assert dateutil.anchor == new_locals.pop("anchor")
     assert dateutil.parser == new_locals.pop("parser")
     assert dateutil.relativedelta == new_locals.pop("relativedelta")
     assert dateutil.rrule == new_locals.pop("rrule")

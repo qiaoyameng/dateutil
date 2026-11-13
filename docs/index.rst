@@ -22,6 +22,7 @@ Contents:
    :maxdepth: 2
 
    easter
+   anchor
    parser
    relativedelta
    rrule
