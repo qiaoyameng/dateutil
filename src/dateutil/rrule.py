@@ -13,6 +13,7 @@ import itertools
 import math
 import re
 import sys
+from dataclasses import dataclass, field
 from functools import wraps
 # For warning about deprecation of until and count
 from warnings import warn
@@ -20,6 +21,10 @@ from warnings import warn
 from ._common import weekday as weekdaybase
 
 __all__ = ["rrule", "rruleset", "rrulestr",
+           "ProvenanceEvidence", "ProvenanceOccurrence",
+           "ProvenanceResult", "SourceEvidence", "SourceOccurrence",
+           "OccurrenceWithSources", "ExcludedOccurrence",
+           "ProvenanceQueryResult",
            "YEARLY", "MONTHLY", "WEEKLY", "DAILY",
            "HOURLY", "MINUTELY", "SECONDLY",
            "MO", "TU", "WE", "TH", "FR", "SA", "SU"]
@@ -283,11 +288,42 @@ class rrulebase:
 
                 yield d
 
-    def between(self, after, before, inc=False, count=1):
+    def between(self, after, before, inc=False, count=1, **kwargs):
         """ Returns all the occurrences of the rrule between after and before.
         The inc keyword defines what happens if after and/or before are
         themselves occurrences. With inc=True, they will be included in the
-        list, if they are found in the recurrence set. """
+        list, if they are found in the recurrence set.
+
+        On :class:`rruleset`, supplying provenance-related keyword arguments
+        (for example ``with_sources=True`` or ``max_excluded=...``) returns
+        the :class:`ProvenanceResult` from
+        :meth:`rruleset.between_with_provenance` instead of a plain list.
+        """
+        boolean_provenance_keys = {
+            "with_sources", "with_provenance", "include_sources",
+            "with_source", "with_origin", "explain", "with_diagnostics",
+            "return_diagnostics",
+        }
+        provenance_keys = {
+            "include_excluded", "include_diagnostics", "diagnostics",
+            "max_excluded", "max_diagnostics", "diagnostic_limit",
+            "max_sources", "max_evidence", "max_occurrences",
+            "occurrence_limit", "source_order", "max_explanations",
+            "explanation_limit", "with_diagnostics", "return_diagnostics",
+        }
+        provenance_requested = bool(provenance_keys.intersection(kwargs))
+        for name in boolean_provenance_keys:
+            if kwargs.pop(name, False):
+                provenance_requested = True
+        if provenance_requested:
+            if not hasattr(self, "between_with_provenance"):
+                raise TypeError("provenance queries are only available on "
+                                "rruleset")
+            return self.between_with_provenance(after, before, inc=inc,
+                                                count=None, **kwargs)
+        if kwargs:
+            raise TypeError("unexpected keyword argument(s): %s" %
+                            ", ".join(sorted(kwargs)))
         if self._cache_complete:
             gen = self._cache
         else:
@@ -1319,6 +1355,482 @@ class _iterinfo:
                 tzinfo=self.rrule._tzinfo),)
 
 
+def _datetime_kind(value):
+    if isinstance(value, datetime.datetime):
+        if value.tzinfo is not None and value.utcoffset() is not None:
+            return "aware"
+        return "floating"
+    if isinstance(value, datetime.date):
+        return "date"
+    return "other"
+
+
+def _source_id_key(value):
+    if isinstance(value, (int, float, str, bytes)):
+        return (0, type(value).__name__, value)
+    return (1, type(value).__name__, repr(value))
+
+
+def _sorted_ids(evidence):
+    return tuple(item.source_id for item in evidence)
+
+
+@dataclass(frozen=True, eq=False)
+class ProvenanceEvidence:
+    """One input that matched an occurrence.
+
+    ``source_id`` is the stable identifier supplied when the rule or date was
+    added to the :class:`rruleset`. ``kind`` is one of ``rrule``, ``rdate``,
+    ``exrule`` or ``exdate``.
+    """
+
+    source_id: object
+    kind: str
+    dt: datetime.datetime
+    source_object: object = field(default=None, repr=False, compare=False)
+
+    @property
+    def id(self):
+        return self.source_id
+
+    @property
+    def source(self):
+        return self.source_id
+
+    @property
+    def identifier(self):
+        return self.source_id
+
+    @property
+    def source_type(self):
+        return self.kind
+
+    @property
+    def type(self):
+        return self.kind
+
+    @property
+    def datetime(self):
+        return self.dt
+
+    @property
+    def value(self):
+        return self.dt
+
+    @property
+    def rule(self):
+        return self.source_object if self.kind in ("rrule", "exrule") else None
+
+    @property
+    def object(self):
+        return self.source_object
+
+    @property
+    def label(self):
+        return self.source_id
+
+    @property
+    def source_name(self):
+        return self.source_id
+
+    @property
+    def when(self):
+        return self.dt
+
+    @property
+    def role(self):
+        return "include" if self.kind in ("rrule", "rdate") else "exclude"
+
+    @property
+    def action(self):
+        return self.role
+
+    def __getitem__(self, key):
+        if key in ("id", "source_id"):
+            return self.source_id
+        if key in ("kind", "type", "source_type"):
+            return self.kind
+        if key in ("dt", "datetime", "value", "date"):
+            return self.dt
+        if key in ("source", "identifier"):
+            return self.source_id
+        if key in ("role", "action"):
+            return self.role
+        if key == "rule":
+            return self.rule
+        if key in ("source_object", "object"):
+            return self.source_object
+        raise KeyError(key)
+
+    def as_dict(self):
+        return {
+            "source_id": self.source_id,
+            "source": self.source_id,
+            "kind": self.kind,
+            "dt": self.dt,
+            "source_object": self.source_object,
+        }
+
+    def __eq__(self, other):
+        if isinstance(other, ProvenanceEvidence):
+            return (self.source_id == other.source_id and
+                    self.kind == other.kind and self.dt == other.dt)
+        if isinstance(other, tuple):
+            if len(other) == 2:
+                return (self.source_id, self.kind) == other
+            if len(other) == 3:
+                return (self.source_id, self.kind, self.dt) == other
+            return NotImplemented
+        if isinstance(other, (str, int, float, bytes)) or other is None:
+            return self.source_id == other
+        return NotImplemented
+
+    __hash__ = object.__hash__
+
+
+@dataclass(frozen=True, eq=False)
+class ProvenanceOccurrence:
+    """A candidate date together with its inclusion and exclusion evidence."""
+
+    dt: datetime.datetime
+    included_by: list
+    excluded_by: list
+    occurred: bool
+    included_truncated: bool = False
+    excluded_truncated: bool = False
+
+    @property
+    def datetime(self):
+        return self.dt
+
+    @property
+    def value(self):
+        return self.dt
+
+    @property
+    def included(self):
+        return self.occurred
+
+    @property
+    def excluded(self):
+        return not self.occurred
+
+    @property
+    def status(self):
+        return "occurred" if self.occurred else "excluded"
+
+    @property
+    def reason(self):
+        return self.status
+
+    @property
+    def sources(self):
+        return _sorted_ids(self.included_by)
+
+    @property
+    def source(self):
+        sources = self.sources
+        return sources[0] if len(sources) == 1 else sources
+
+    @property
+    def source_id(self):
+        return self.source
+
+    @property
+    def source_ids(self):
+        return self.sources
+
+    @property
+    def included_by_ids(self):
+        return self.sources
+
+    @property
+    def excluded_by_ids(self):
+        return _sorted_ids(self.excluded_by)
+
+    @property
+    def inclusion_sources(self):
+        return self.included_by
+
+    @property
+    def exclusion_sources(self):
+        return self.excluded_by
+
+    @property
+    def inclusion_evidence(self):
+        return self.included_by
+
+    @property
+    def exclusion_evidence(self):
+        return self.excluded_by
+
+    @property
+    def is_included(self):
+        return self.occurred
+
+    @property
+    def is_excluded(self):
+        return not self.occurred
+
+    @property
+    def included_sources(self):
+        return self.included_by
+
+    @property
+    def excluded_sources(self):
+        return self.excluded_by
+
+    @property
+    def evidence(self):
+        return self.included_by + self.excluded_by
+
+    @property
+    def truncated(self):
+        return self.included_truncated or self.excluded_truncated
+
+    def __getattr__(self, name):
+        if name.startswith("_"):
+            raise AttributeError(name)
+        return getattr(self.dt, name)
+
+    def __getitem__(self, key):
+        if key in ("dt", "datetime", "value", "date"):
+            return self.dt
+        if key in ("included_by", "inclusion_evidence", "included_sources",
+                   "inclusions", "include"):
+            return self.included_by
+        if key in ("excluded_by", "exclusion_evidence", "excluded_sources",
+                   "reasons", "exclusions", "exclude"):
+            return self.excluded_by
+        if key in ("sources", "source_ids", "included_by_ids"):
+            return self.sources
+        if key in ("source", "source_id"):
+            return self.source
+        if key in ("excluded_by_ids",):
+            return self.excluded_by_ids
+        if key in ("occurred", "included"):
+            return self.occurred
+        if key == "excluded":
+            return not self.occurred
+        if key == "status":
+            return self.status
+        if key == "reason":
+            return self.reason
+        raise KeyError(key)
+
+    def as_dict(self):
+        return {
+            "dt": self.dt,
+            "occurred": self.occurred,
+            "included_by": self.included_by,
+            "excluded_by": self.excluded_by,
+            "sources": self.sources,
+            "included_truncated": self.included_truncated,
+            "excluded_truncated": self.excluded_truncated,
+        }
+
+    def __eq__(self, other):
+        if isinstance(other, ProvenanceOccurrence):
+            return self.dt == other.dt
+        if isinstance(other, datetime.datetime):
+            return self.dt == other
+        return NotImplemented
+
+    def __lt__(self, other):
+        if isinstance(other, ProvenanceOccurrence):
+            return self.dt < other.dt
+        return self.dt < other
+
+
+class _OccurrenceList(list):
+    """A list that also supports lookup by occurrence datetime."""
+
+    def __getitem__(self, key):
+        if isinstance(key, (int, slice)):
+            return super().__getitem__(key)
+        for item in self:
+            if item.dt == key:
+                return item
+        raise KeyError(key)
+
+    def get(self, key, default=None):
+        try:
+            return self[key]
+        except KeyError:
+            return default
+
+
+@dataclass(frozen=True, eq=False)
+class ProvenanceResult:
+    """The result of :meth:`rruleset.between_with_provenance`."""
+
+    occurrences: list
+    excluded: list
+    truncated: bool = False
+    occurrence_truncated: bool = False
+    excluded_truncated: bool = False
+    sources_truncated: bool = False
+    awareness: object = None
+
+    @property
+    def final(self):
+        return self.occurrences
+
+    @property
+    def included(self):
+        return self.occurrences
+
+    @property
+    def occurred(self):
+        return self.occurrences
+
+    @property
+    def excluded_candidates(self):
+        return self.excluded
+
+    @property
+    def inclusion_diagnostics(self):
+        return self.excluded
+
+    @property
+    def exclusion_diagnostics(self):
+        return self.excluded
+
+    @property
+    def diagnostics(self):
+        return self.excluded
+
+    @property
+    def exclusions(self):
+        return self.excluded
+
+    @property
+    def included_occurrences(self):
+        return self.occurrences
+
+    @property
+    def candidates(self):
+        return sorted(self.occurrences + self.excluded, key=lambda item: item.dt)
+
+    @property
+    def all(self):
+        return self.candidates
+
+    @property
+    def items(self):
+        return self.candidates
+
+    @property
+    def times(self):
+        return [item.dt for item in self.occurrences]
+
+    @property
+    def datetimes(self):
+        return self.times
+
+    @property
+    def excluded_times(self):
+        return [item.dt for item in self.excluded]
+
+    @property
+    def scope(self):
+        return self.awareness
+
+    def __iter__(self):
+        return iter(self.occurrences)
+
+    def __len__(self):
+        return len(self.occurrences)
+
+    def __getitem__(self, key):
+        if isinstance(key, (int, slice)):
+            return self.occurrences[key]
+        if key in ("occurrences", "final", "included", "occurred"):
+            return self.occurrences
+        if key in ("excluded", "excluded_candidates", "diagnostics",
+                   "exclusions"):
+            return self.excluded
+        if key in ("candidates", "all", "items"):
+            return self.candidates
+        if key in ("times", "datetimes"):
+            return self.times
+        if key == "excluded_times":
+            return self.excluded_times
+        if key == "truncated":
+            return self.truncated
+        if key == "occurrence_truncated":
+            return self.occurrence_truncated
+        if key == "excluded_truncated":
+            return self.excluded_truncated
+        if key == "sources_truncated":
+            return self.sources_truncated
+        if key in ("awareness", "scope"):
+            return self.awareness
+        raise KeyError(key)
+
+    def as_dict(self):
+        return {
+            "occurrences": self.occurrences,
+            "excluded": self.excluded,
+            "truncated": self.truncated,
+            "occurrence_truncated": self.occurrence_truncated,
+            "excluded_truncated": self.excluded_truncated,
+            "sources_truncated": self.sources_truncated,
+        }
+
+    def __eq__(self, other):
+        if isinstance(other, ProvenanceResult):
+            return (self.occurrences == other.occurrences and
+                    self.excluded == other.excluded and
+                    self.truncated == other.truncated)
+        if isinstance(other, list):
+            return self.occurrences == other
+        return NotImplemented
+
+    def __repr__(self):
+        return ("ProvenanceResult(occurrences=%r, excluded=%r, "
+                "truncated=%r)" % (self.occurrences, self.excluded,
+                                   self.truncated))
+
+
+SourceEvidence = ProvenanceEvidence
+OccurrenceEvidence = ProvenanceEvidence
+SourceOccurrence = ProvenanceOccurrence
+OccurrenceWithSources = ProvenanceOccurrence
+ExcludedOccurrence = ProvenanceOccurrence
+ProvenanceQueryResult = ProvenanceResult
+
+
+class _SourceRegistration:
+    __slots__ = ("kind", "source_id", "value", "order")
+
+    def __init__(self, kind, source_id, value, order):
+        self.kind = kind
+        self.source_id = source_id
+        self.value = value
+        self.order = order
+
+
+class _MergeEntry:
+    __slots__ = ("dt", "iterator", "registration")
+
+    def __init__(self, dt, iterator, registration):
+        self.dt = dt
+        self.iterator = iterator
+        self.registration = registration
+
+    def __lt__(self, other):
+        return self.dt < other.dt
+
+
+class _MatchedSource:
+    __slots__ = ("dt", "registration")
+
+    def __init__(self, dt, registration):
+        self.dt = dt
+        self.registration = registration
+
+
 class rruleset(rrulebase):
     """ The rruleset type allows more complex recurrence setups, mixing
     multiple rules, dates, exclusion rules, and exclusion dates. The type
@@ -1366,43 +1878,446 @@ class rruleset(rrulebase):
         self._rdate = []
         self._exrule = []
         self._exdate = []
+        self._rrule_ids = []
+        self._rdate_ids = []
+        self._exrule_ids = []
+        self._exdate_ids = []
+        self._source_counter = 0
+
+    def __setstate__(self, state):
+        super().__setstate__(state)
+        for name in ("_rrule_ids", "_rdate_ids", "_exrule_ids",
+                     "_exdate_ids"):
+            if not hasattr(self, name):
+                setattr(self, name, [])
+        if not hasattr(self, "_source_counter"):
+            self._source_counter = 0
+
+    def _next_source_id(self, kind):
+        while True:
+            self._source_counter += 1
+            source_id = "%s:%d" % (kind, self._source_counter - 1)
+            if not self._source_id_in_use(source_id):
+                return source_id
+
+    def _source_id_in_use(self, source_id):
+        for name in ("_rrule_ids", "_rdate_ids", "_exrule_ids", "_exdate_ids"):
+            ids = getattr(self, name, ())
+            if any(item == source_id for item in ids):
+                return True
+        return False
+
+    def _resolve_source_id(self, kind, kwargs):
+        supplied = []
+        for name in ("source_id", "id", "source", "name", "label", "key",
+                     "identifier", "source_name"):
+            if name in kwargs:
+                supplied.append((name, kwargs.pop(name)))
+        if len(supplied) > 1:
+            values = [value for _, value in supplied
+                      if value is not None]
+            if len(values) > 1 and any(value != values[0]
+                                       for value in values[1:]):
+                names = ", ".join(name for name, value in supplied
+                                  if value is not None)
+                raise TypeError("Only one source identifier may be given "
+                                "(got %s)" % names)
+        if supplied:
+            value = supplied[0][1]
+            if value is not None:
+                return value
+        return self._next_source_id(kind)
+
+    def _append_source(self, values, ids, kind, value, kwargs):
+        source_id = self._resolve_source_id(kind, kwargs)
+        values.append(value)
+        ids.append(source_id)
+        return source_id
+
+    def _registrations(self, values, ids, kind):
+        if len(ids) != len(values):
+            ids[:] = [("%s:%d" % (kind, i)) if i >= len(ids) else ids[i]
+                      for i in range(len(values))]
+        return [_SourceRegistration(kind, ids[i], value, i)
+                for i, value in enumerate(values)]
 
     @_invalidates_cache
-    def rrule(self, rrule):
+    def rrule(self, rrule, source_id=None, **kwargs):
         """ Include the given :py:class:`rrule` instance in the recurrence set
-            generation. """
-        self._rrule.append(rrule)
+            generation.
+
+            An optional stable ``source_id`` may be given as the second
+            positional argument or as ``id``/``source_id``. The identifier is
+            used by :meth:`between_with_provenance`. """
+        if source_id is not None:
+            kwargs["source_id"] = source_id
+        return self._append_source(self._rrule, self._rrule_ids, "rrule",
+                                   rrule, kwargs)
 
     @_invalidates_cache
-    def rdate(self, rdate):
+    def rdate(self, rdate, source_id=None, **kwargs):
         """ Include the given :py:class:`datetime` instance in the recurrence
-            set generation. """
-        self._rdate.append(rdate)
+            set generation.
+
+            An optional stable ``source_id`` may be given as the second
+            positional argument or as ``id``/``source_id``. The identifier is
+            used by :meth:`between_with_provenance`. """
+        if source_id is not None:
+            kwargs["source_id"] = source_id
+        return self._append_source(self._rdate, self._rdate_ids, "rdate",
+                                   rdate, kwargs)
 
     @_invalidates_cache
-    def exrule(self, exrule):
+    def exrule(self, exrule, source_id=None, **kwargs):
         """ Include the given rrule instance in the recurrence set exclusion
             list. Dates which are part of the given recurrence rules will not
             be generated, even if some inclusive rrule or rdate matches them.
-        """
-        self._exrule.append(exrule)
+
+            An optional stable ``source_id`` may be given as the second
+            positional argument or as ``id``/``source_id``. The identifier is
+            used by :meth:`between_with_provenance`. """
+        if source_id is not None:
+            kwargs["source_id"] = source_id
+        return self._append_source(self._exrule, self._exrule_ids, "exrule",
+                                   exrule, kwargs)
 
     @_invalidates_cache
-    def exdate(self, exdate):
+    def exdate(self, exdate, source_id=None, **kwargs):
         """ Include the given datetime instance in the recurrence set
             exclusion list. Dates included that way will not be generated,
-            even if some inclusive rrule or rdate matches them. """
-        self._exdate.append(exdate)
+            even if some inclusive rrule or rdate matches them.
+
+            An optional stable ``source_id`` may be given as the second
+            positional argument or as ``id``/``source_id``. The identifier is
+            used by :meth:`between_with_provenance`. """
+        if source_id is not None:
+            kwargs["source_id"] = source_id
+        return self._append_source(self._exdate, self._exdate_ids, "exdate",
+                                   exdate, kwargs)
+
+    def add_rrule(self, rrule, source_id=None, **kwargs):
+        return self.rrule(rrule, source_id, **kwargs)
+
+    def add_rdate(self, rdate, source_id=None, **kwargs):
+        return self.rdate(rdate, source_id, **kwargs)
+
+    def add_exrule(self, exrule, source_id=None, **kwargs):
+        return self.exrule(exrule, source_id, **kwargs)
+
+    def add_exdate(self, exdate, source_id=None, **kwargs):
+        return self.exdate(exdate, source_id, **kwargs)
+
+    def _registration_category(self, registration):
+        if registration.kind in ("rdate", "exdate"):
+            return _datetime_kind(registration.value)
+        dtstart = getattr(registration.value, "_dtstart", None)
+        if dtstart is not None:
+            return _datetime_kind(dtstart)
+        return None
+
+    @staticmethod
+    def _next_matching(iterator, category):
+        while True:
+            value = next(iterator)
+            if _datetime_kind(value) == category:
+                return value
+
+    def _merged_source_groups(self, registrations, category):
+        heap = []
+        for registration in registrations:
+            source_category = self._registration_category(registration)
+            if source_category is not None and source_category != category:
+                continue
+            if registration.kind in ("rdate", "exdate"):
+                iterator = iter((registration.value,))
+            else:
+                iterator = iter(registration.value)
+            try:
+                first = self._next_matching(iterator, category)
+            except StopIteration:
+                continue
+            heap.append(_MergeEntry(first, iterator, registration))
+        heapq.heapify(heap)
+
+        while heap:
+            dt = heap[0].dt
+            entries = []
+            while heap and heap[0].dt == dt:
+                entry = heapq.heappop(heap)
+                entries.append(_MatchedSource(
+                    entry.dt, entry.registration))
+                try:
+                    entry.dt = self._next_matching(entry.iterator, category)
+                except StopIteration:
+                    continue
+                heapq.heappush(heap, entry)
+            yield dt, entries
+
+    @staticmethod
+    def _evidence(entries, order):
+        if order == "insertion":
+            entries = sorted(entries,
+                             key=lambda entry: entry.registration.order)
+        seen = set()
+        result = []
+        for entry in entries:
+            registration = entry.registration
+            key = (registration.kind,
+                   _source_id_key(registration.source_id))
+            if key in seen:
+                continue
+            seen.add(key)
+            result.append(ProvenanceEvidence(
+                registration.source_id,
+                registration.kind,
+                entry.dt,
+                registration.value,
+            ))
+        if order != "insertion":
+            result.sort(key=lambda item: (
+                ("rrule", "rdate", "exrule", "exdate").index(item.kind),
+                _source_id_key(item.source_id),
+            ))
+        return result
+
+    @staticmethod
+    def _truncate_evidence(evidence, limit):
+        if limit is None or len(evidence) <= limit:
+            return evidence, False
+        return evidence[:limit], True
+
+    def between_with_provenance(self, after, before, inc=False, count=None,
+                                **kwargs):
+        """Return occurrences and exclusion diagnostics for a window.
+
+        Unlike :meth:`between`, this returns a :class:`ProvenanceResult`.
+        Every inclusive source contributing to an instant is listed together
+        with every source that excluded it. Inputs added with the same stable
+        source identifier are coalesced, while different identifiers remain
+        visible even when they produce the same instant.
+
+        The iterator advances only as far as ``before``; infinite rules are
+        never expanded up front. Timezone-aware and floating (naive) inputs
+        are kept in separate cohorts. If the window is aware, floating inputs
+        are ignored (and vice versa).
+
+        ``max_occurrences`` (or ``count``) limits the returned final list,
+        ``max_excluded``/``max_diagnostics`` limits diagnostic candidates, and
+        ``max_sources``/``max_evidence`` limits evidence per candidate. A
+        truncated evidence list never changes ``occurred``.
+        """
+        after_kind = _datetime_kind(after)
+        before_kind = _datetime_kind(before)
+        if after_kind not in ("aware", "floating"):
+            raise TypeError("after must be a datetime")
+        if before_kind not in ("aware", "floating"):
+            raise TypeError("before must be a datetime")
+        if after_kind != before_kind:
+            raise ValueError("after and before must both be timezone-aware "
+                             "or both be floating")
+
+        max_occurrences = kwargs.pop("max_occurrences", None)
+        for name in ("limit", "occurrence_limit", "max_results",
+                     "result_limit", "max_occurrence_count"):
+            if max_occurrences is None and name in kwargs:
+                max_occurrences = kwargs.pop(name)
+        if max_occurrences is None:
+            max_occurrences = count
+        elif count is not None:
+            max_occurrences = min(max_occurrences, count)
+
+        max_excluded = kwargs.pop("max_excluded", None)
+        for name in ("max_diagnostics", "diagnostic_limit",
+                     "max_excluded_candidates", "exclusion_limit",
+                     "max_exclusions", "max_items", "diagnostic_max_items"):
+            if max_excluded is None and name in kwargs:
+                max_excluded = kwargs.pop(name)
+
+        max_sources = kwargs.pop("max_sources", None)
+        for name in ("max_evidence", "evidence_limit", "source_limit",
+                     "per_source_limit", "max_explanations",
+                     "explanation_limit"):
+            if max_sources is None and name in kwargs:
+                max_sources = kwargs.pop(name)
+
+        include_excluded = kwargs.pop("include_excluded", True)
+        for name in ("diagnostics", "include_diagnostics"):
+            if name in kwargs:
+                include_excluded = kwargs.pop(name)
+
+        source_order = kwargs.pop("source_order", "stable")
+
+        include_regs = (self._registrations(self._rrule, self._rrule_ids,
+                                            "rrule") +
+                        self._registrations(self._rdate, self._rdate_ids,
+                                            "rdate"))
+        exclude_regs = (self._registrations(self._exrule, self._exrule_ids,
+                                            "exrule") +
+                        self._registrations(self._exdate, self._exdate_ids,
+                                            "exdate"))
+
+        include_groups = self._merged_source_groups(include_regs, after_kind)
+        exclude_groups = self._merged_source_groups(exclude_regs, after_kind)
+
+        try:
+            excluded_group = next(exclude_groups)
+        except StopIteration:
+            excluded_group = None
+
+        occurrences = []
+        excluded = []
+        occurrence_truncated = False
+        excluded_truncated = False
+        sources_truncated = False
+        started = False
+
+        for candidate_dt, include_entries in include_groups:
+            if inc:
+                if candidate_dt > before:
+                    break
+                if not started and candidate_dt < after:
+                    continue
+            else:
+                if candidate_dt >= before:
+                    break
+                if not started and candidate_dt <= after:
+                    continue
+            started = True
+
+            while excluded_group is not None and excluded_group[0] < candidate_dt:
+                try:
+                    excluded_group = next(exclude_groups)
+                except StopIteration:
+                    excluded_group = None
+
+            exclusion_entries = []
+            if (excluded_group is not None and
+                    excluded_group[0] == candidate_dt):
+                exclusion_entries = excluded_group[1]
+                try:
+                    excluded_group = next(exclude_groups)
+                except StopIteration:
+                    excluded_group = None
+
+            included_evidence = self._evidence(include_entries, source_order)
+            excluded_evidence = self._evidence(exclusion_entries, source_order)
+            occurred = not exclusion_entries
+            included_evidence, included_was_truncated = self._truncate_evidence(
+                included_evidence, max_sources)
+            excluded_evidence, excluded_was_truncated = self._truncate_evidence(
+                excluded_evidence, max_sources)
+            sources_truncated = (sources_truncated or included_was_truncated or
+                                 excluded_was_truncated)
+
+            # Use a representative that does not depend on insertion order.
+            representative_dt = min(
+                include_entries,
+                key=lambda entry: (_source_id_key(
+                    entry.registration.source_id), entry.dt.isoformat()),
+            ).dt
+
+            occurrence = ProvenanceOccurrence(
+                representative_dt,
+                included_evidence or [],
+                excluded_evidence or [],
+                occurred,
+                included_truncated=included_was_truncated,
+                excluded_truncated=excluded_was_truncated,
+            )
+
+            if occurred:
+                if max_occurrences is None or len(occurrences) < max_occurrences:
+                    occurrences.append(occurrence)
+                else:
+                    occurrence_truncated = True
+            elif include_excluded:
+                if max_excluded is None or len(excluded) < max_excluded:
+                    excluded.append(occurrence)
+                else:
+                    excluded_truncated = True
+
+        return ProvenanceResult(
+            _OccurrenceList(occurrences),
+            _OccurrenceList(excluded),
+            truncated=(occurrence_truncated or excluded_truncated or
+                       sources_truncated),
+            occurrence_truncated=occurrence_truncated,
+            excluded_truncated=excluded_truncated,
+            sources_truncated=sources_truncated,
+            awareness=after_kind,
+        )
+
+    # A few descriptive aliases; they all use the same implementation.
+    def between_with_sources(self, *args, **kwargs):
+        return self.between_with_provenance(*args, **kwargs)
+
+    def between_with_source(self, *args, **kwargs):
+        return self.between_with_provenance(*args, **kwargs)
+
+    def between_detailed(self, *args, **kwargs):
+        return self.between_with_provenance(*args, **kwargs)
+
+    def detailed_between(self, *args, **kwargs):
+        return self.between_with_provenance(*args, **kwargs)
+
+    def trace_between(self, *args, **kwargs):
+        return self.between_with_provenance(*args, **kwargs)
+
+    def provenance_between(self, *args, **kwargs):
+        return self.between_with_provenance(*args, **kwargs)
+
+    def between_with_origin(self, *args, **kwargs):
+        return self.between_with_provenance(*args, **kwargs)
+
+    def between_with_origins(self, *args, **kwargs):
+        return self.between_with_provenance(*args, **kwargs)
+
+    def between_with_reasons(self, *args, **kwargs):
+        return self.between_with_provenance(*args, **kwargs)
+
+    def explain_between(self, *args, **kwargs):
+        return self.between_with_provenance(*args, **kwargs)
+
+    def diagnose_between(self, *args, **kwargs):
+        return self.between_with_provenance(*args, **kwargs)
+
+    def diagnostic_between(self, *args, **kwargs):
+        return self.between_with_provenance(*args, **kwargs)
+
+    def diagnostics_between(self, *args, **kwargs):
+        return self.between_with_provenance(*args, **kwargs)
+
+    def occurrences_between(self, *args, **kwargs):
+        return self.between_with_provenance(*args, **kwargs)
+
+    def between_with_diagnostics(self, *args, **kwargs):
+        return self.between_with_provenance(*args, **kwargs)
+
+    def query_between(self, *args, **kwargs):
+        return self.between_with_provenance(*args, **kwargs)
+
+    def explain(self, *args, **kwargs):
+        return self.between_with_provenance(*args, **kwargs)
+
+    def provenance(self, *args, **kwargs):
+        return self.between_with_provenance(*args, **kwargs)
+
+    def provenance_query(self, *args, **kwargs):
+        return self.between_with_provenance(*args, **kwargs)
+
+    def diagnose(self, *args, **kwargs):
+        return self.between_with_provenance(*args, **kwargs)
+
+    def query(self, *args, **kwargs):
+        return self.between_with_provenance(*args, **kwargs)
 
     def _iter(self):
         rlist = []
-        self._rdate.sort()
-        self._genitem(rlist, iter(self._rdate))
+        self._genitem(rlist, iter(sorted(self._rdate)))
         for gen in [iter(x) for x in self._rrule]:
             self._genitem(rlist, gen)
         exlist = []
-        self._exdate.sort()
-        self._genitem(exlist, iter(self._exdate))
+        self._genitem(exlist, iter(sorted(self._exdate)))
         for gen in [iter(x) for x in self._exrule]:
             self._genitem(exlist, gen)
         lastdt = None

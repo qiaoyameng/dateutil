@@ -17,6 +17,35 @@ Classes
    :undoc-members:
    :inherited-members:
 
+Provenance queries
+------------------
+
+``rruleset`` inputs can be given a stable identifier when they are added:
+
+.. code-block:: python
+
+    from datetime import datetime
+    from dateutil.rrule import DAILY, rrule, rruleset
+
+    start = datetime(2024, 1, 1, 9)
+    rrset = rruleset()
+    rrset.rrule(rrule(DAILY, dtstart=start, count=3), id="daily")
+    rrset.exdate(datetime(2024, 1, 2, 9), id="holiday")
+
+``between_with_provenance`` returns final occurrences separately from
+excluded candidates. Each result records the identifiers of all inclusive
+inputs that produced the instant and all exclusion inputs that removed it.
+The query is lazy and only advances through the requested window.
+
+.. code-block:: python
+
+    result = rrset.between_with_provenance(
+        start, datetime(2024, 1, 5))
+    result.times
+    [(item.dt, item.sources) for item in result.occurrences]
+    [(item.dt, item.included_by_ids, item.excluded_by_ids)
+     for item in result.excluded]
+
 Functions
 ---------
 
