@@ -22,6 +22,7 @@ Contents:
    :maxdepth: 2
 
    easter
+   isointerval
    parser
    relativedelta
    rrule
